@@ -5,7 +5,7 @@ description: >
   KNX/IP failover proxy with full KNX/IP front-end support (UDP + TCP)
   and automatic backend failover. Supports TCP/IP, UDP/IP, and USB/serial
   interfaces with monitored recovery and seamless reconnect behavior.
-version: "2.6.9"
+version: "2.6.10"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
