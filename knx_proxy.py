@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.25"
+VERSION      = "2.6.26"
 BACKEND_FILE = "/run/knx-active-backend"
 BACKEND_REJECT_FILE = "/run/knx-backend-reject"
 MAGIC        = b'\x06\x10'
@@ -601,8 +601,12 @@ class KNXProxy:
         elif len(resp_body) > 2:
             crd = resp_body[2:]
 
-        c_proto  = PROTO_TCP if client_type == 'tcp' else PROTO_UDP
-        c_resp   = bytes([ch_id, 0x00]) + make_hpai('0.0.0.0', self.port, c_proto) + crd
+        c_proto = PROTO_TCP if client_type == 'tcp' else PROTO_UDP
+        # For TCP frontend tunneling, many clients expect a wildcard endpoint
+        # (port 0) in CONNECT_RESPONSE since data/control travel over the same
+        # established TCP stream.
+        c_port = 0 if client_type == 'tcp' else self.port
+        c_resp = bytes([ch_id, 0x00]) + make_hpai('0.0.0.0', c_port, c_proto) + crd
         c_frame  = make_frame(CONNECT_RESP, c_resp)
 
         sess = Session(ch_id, client_type, client_ctrl, client_data, client_sock,
@@ -625,6 +629,10 @@ class KNXProxy:
             self._notify_backend_disconnect(sess)
             sess.close()
             return
+
+        log.info(
+            f"CONNECT_RESP sent: ch={ch_id} status=0x00 hpai=0.0.0.0:{c_port}/{('tcp' if c_proto == PROTO_TCP else 'udp')}"
+        )
 
         log.info(f"Session {ch_id} up: {client_type.upper()} {client_ctrl[0]}:{client_ctrl[1]}"
                  f" ↔ {b_proto.upper()} {b_host}:{b_port}")
