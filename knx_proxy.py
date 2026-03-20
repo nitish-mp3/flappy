@@ -483,7 +483,13 @@ class KNXProxy:
             sess = self.sessions.get(ch)
             if sess and sess.alive:
                 sess.last_seen = time.monotonic()
-                sess.send_to_backend(data)
+                if not sess.send_to_backend(data):
+                    log.debug(f"UDP CONNSTATE fwd failed ch={ch} — responding locally")
+                    resp_body = bytes([ch, 0x00])
+                    self.udp.sendto(make_frame(CONNSTATE_RESP, resp_body), addr)
+            else:
+                resp_body = bytes([ch, 0x00])
+                self.udp.sendto(make_frame(CONNSTATE_RESP, resp_body), addr)
 
         elif svc in (DISCONNECT_REQ, DISCONNECT_RESP):
             ch = body[0] if body else 0
@@ -506,12 +512,20 @@ class KNXProxy:
     def _handle_tcp_client(self, sock: socket.socket, addr: Tuple[str, int]):
         """Handle a connected TCP client."""
         log.info(f"TCP client connected: {addr[0]}:{addr[1]}")
-        sock.settimeout(30.0)
+        # CRITICAL: xknx sends CONNECTIONSTATE_REQUEST every 60s.
+        # Timeout must be > 60s to avoid dropping the connection before
+        # the next heartbeat arrives. 120s gives comfortable margin.
+        sock.settimeout(120.0)
         ch_id = None
 
         try:
             while self.running:
-                svc, body = read_tcp_frame(sock)
+                try:
+                    svc, body = read_tcp_frame(sock)
+                except socket.timeout:
+                    # Timeout is fine — just loop back and wait for more data.
+                    # The maintenance loop handles stale session cleanup.
+                    continue
                 if svc is None:
                     break
 
@@ -561,7 +575,22 @@ class KNXProxy:
                     sess = self.sessions.get(ch)
                     if sess and sess.alive:
                         sess.last_seen = time.monotonic()
-                        sess.send_to_backend(make_frame(svc, body))
+                        # Try to forward to backend; if that fails,
+                        # respond locally to keep the client session alive.
+                        if not sess.send_to_backend(make_frame(svc, body)):
+                            log.debug(f"CONNSTATE fwd failed ch={ch} — responding locally")
+                            resp_body = bytes([ch, 0x00])
+                            try:
+                                sock.sendall(make_frame(CONNSTATE_RESP, resp_body))
+                            except Exception:
+                                pass
+                    else:
+                        # No session — still respond to avoid client disconnect
+                        resp_body = bytes([ch, 0x00])
+                        try:
+                            sock.sendall(make_frame(CONNSTATE_RESP, resp_body))
+                        except Exception:
+                            pass
 
                 elif svc in (DISCONNECT_REQ, DISCONNECT_RESP):
                     ch = body[0] if body else 0

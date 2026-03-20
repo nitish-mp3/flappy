@@ -151,17 +151,27 @@ class BackendConnector:
         self.connect_timeout = connect_timeout
 
     def open_socket(self, host: str, port: int, proto: str) -> socket.socket:
-        """Open a raw socket to the backend."""
+        """
+        Open a raw socket to the backend.
+        Uses connect_timeout for the initial connection, then resets
+        to a longer timeout suitable for long-lived relay (must be
+        > 60s to survive the xknx heartbeat cycle).
+        """
         if proto == 'tcp':
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(self.connect_timeout)
             s.connect((host, port))
+            # After connect, use long timeout for relay — must survive
+            # xknx's 60-second heartbeat interval.
+            s.settimeout(65.0)
             return s
         else:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(self.connect_timeout)
             s.bind(('0.0.0.0', 0))
             s.connect((host, port))
+            # After connect, use long timeout for relay
+            s.settimeout(65.0)
             return s
 
     def negotiate_tunnel(self, bsock: socket.socket, host: str, port: int,
