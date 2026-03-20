@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.16"
+readonly VERSION="2.6.17"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -517,6 +517,23 @@ enter_backup() {
     return 0
 }
 
+enter_backup_fast() {
+    # Runtime emergency path: if active backend hard-rejects CONNECT,
+    # move traffic to backup immediately and let live traffic validate it.
+    local proto="udp"
+    log_notice "→ BACKUP-FAST (${BACKUP_HOST}:${BACKUP_PORT} [${proto}])"
+    CURRENT_STATE="$STATE_BACKUP"
+    BACKUP_FAIL_COUNT=0
+    PRIMARY_RISE_COUNT=0
+    BACKUP_CONNECT_REJECT_COUNT=0
+    stop_bridge
+    set_backend "$BACKUP_HOST" "$BACKUP_PORT" "$proto"
+    reload_proxy
+    write_state
+    ha_notify "Failover to backup" "Primary tunnel reject. Using ${BACKUP_HOST}:${BACKUP_PORT} [${proto}] (fast)."
+    return 0
+}
+
 enter_usb() {
     log_notice "→ USB (${USB_DEVICE}, ${USB_BAUD} baud)"
     CURRENT_STATE="$STATE_USB"
@@ -589,10 +606,7 @@ tick_primary() {
     rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
         log_warn "Primary tunnel hard-reject detected (${rej_status}) — failing over now"
-        local bproto_now; bproto_now="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-        if [[ "$bproto_now" != "none" ]]; then enter_backup "$bproto_now"
-        elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
-        else enter_degraded "primary-hard-reject-no-backup"; fi
+        enter_backup_fast
         return 0
     fi
 
@@ -605,10 +619,7 @@ tick_primary() {
             log_warn "Primary tunnel rejected recently (${rej_status}) (${PRIMARY_CONNECT_REJECT_COUNT}/2)"
             if [[ "$PRIMARY_CONNECT_REJECT_COUNT" -ge 2 ]]; then
                 log_warn "Primary reachable but not tunnel-usable — failing over"
-                local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-                if [[ "$bproto" != "none" ]]; then enter_backup "$bproto"
-                elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
-                else enter_degraded "primary-tunnel-reject-no-backup"; fi
+                enter_backup_fast
                 return 0
             fi
         else
