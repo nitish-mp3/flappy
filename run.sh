@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.22"
+readonly VERSION="2.6.23"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -139,6 +139,22 @@ set_primary_holdoff() {
     now="$(date +%s)"
     PRIMARY_HOLD_UNTIL=$(( now + PRIMARY_RECOVERY_HOLD_SECS ))
     log_warn "Holding primary recovery for ${PRIMARY_RECOVERY_HOLD_SECS}s (${reason})"
+}
+
+is_primary_holdoff_active() {
+    local now
+    now="$(date +%s)"
+    [[ "$now" -lt "$PRIMARY_HOLD_UNTIL" ]]
+}
+
+primary_holdoff_remaining() {
+    local now remain
+    now="$(date +%s)"
+    remain=$(( PRIMARY_HOLD_UNTIL - now ))
+    if [[ "$remain" -lt 0 ]]; then
+        remain=0
+    fi
+    echo "$remain"
 }
 
 select_backend_proto() {
@@ -730,11 +746,9 @@ tick_backup() {
         return 0
     fi
 
-    local now
-    now="$(date +%s)"
-    if [[ "$now" -lt "$PRIMARY_HOLD_UNTIL" ]]; then
+    if is_primary_holdoff_active; then
         local remain
-        remain=$(( PRIMARY_HOLD_UNTIL - now ))
+        remain="$(primary_holdoff_remaining)"
         log_debug "Primary recovery holdoff active (${remain}s remaining)"
         PRIMARY_RISE_COUNT=0
     else
@@ -754,28 +768,15 @@ tick_backup() {
     local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$bproto" != "none" ]]; then
         bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
-        rej_status="$(read_backend_reject_status "$BACKUP_HOST" "$BACKUP_PORT")"
-        if [[ -n "$rej_status" ]]; then
-            BACKUP_CONNECT_REJECT_COUNT=$((BACKUP_CONNECT_REJECT_COUNT + 1))
-            log_warn "Backup tunnel rejected recently (${rej_status}) (${BACKUP_CONNECT_REJECT_COUNT}/2)"
-            if [[ "$BACKUP_CONNECT_REJECT_COUNT" -ge 2 ]]; then
-                if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
-                else enter_degraded "backup-tunnel-reject"; fi
-                return 0
-            fi
-        else
-            BACKUP_CONNECT_REJECT_COUNT=0
-        fi
-
-        log_debug "Backup: OK [${bproto}]"; BACKUP_FAIL_COUNT=0
+        log_debug "Backup: probe OK [${bproto}]"
+        BACKUP_FAIL_COUNT=0
     else
+        # Do not leave BACKUP solely due to probe failures.
+        # Real tunnel-level rejects are handled above via BACKEND_REJECT_FILE.
         BACKUP_FAIL_COUNT=$((BACKUP_FAIL_COUNT + 1))
-        log_warn "Backup probe failed (${BACKUP_FAIL_COUNT}/${CHECK_FALL})"
-        if [[ "$BACKUP_FAIL_COUNT" -ge "$CHECK_FALL" ]]; then
-            if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
-            else enter_degraded "backup-failed-no-usb"; fi
-        fi
-    fi; return 0
+        log_warn "Backup probe failed (${BACKUP_FAIL_COUNT}/${CHECK_FALL}) — keeping BACKUP until tunnel rejects"
+    fi
+    return 0
 }
 
 tick_usb() {
@@ -801,10 +802,16 @@ tick_usb() {
 
 tick_degraded() {
     log_debug "DEGRADED: retrying all interfaces..."
-    local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
-    if [[ "$proto" != "none" ]]; then
-        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
-        log_notice "Primary back [${proto}]"; enter_primary "$proto"; return 0; fi
+    if is_primary_holdoff_active; then
+        local remain
+        remain="$(primary_holdoff_remaining)"
+        log_debug "Primary recovery holdoff active in DEGRADED (${remain}s remaining)"
+    else
+        local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+        if [[ "$proto" != "none" ]]; then
+            proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+            log_notice "Primary back [${proto}]"; enter_primary "$proto"; return 0; fi
+    fi
     proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$proto" != "none" ]]; then
         proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
