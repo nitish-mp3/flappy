@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.21"
+readonly VERSION="2.6.22"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -36,6 +36,7 @@ USB_DEVICE=""   USB_BAUD=""
 CHECK_INTERVAL="" CHECK_FALL="" CHECK_RISE=""
 LOG_LEVEL=""    USB_PRIORITY=""   NOTIFY_ON_FAILOVER=""
 CONNECTION_TIMEOUT="" PREFER_PROTOCOL=""
+PRIMARY_RECOVERY_HOLD_SECS=""
 
 CURRENT_STATE=""
 SOCAT_PID=""
@@ -47,6 +48,7 @@ BACKUP_FAIL_COUNT=0
 PRIMARY_CONNECT_REJECT_COUNT=0
 BACKUP_CONNECT_REJECT_COUNT=0
 PRIMARY_TCP_RETRY_DONE=0
+PRIMARY_HOLD_UNTIL=0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -98,6 +100,7 @@ load_config() {
     CHECK_RISE="$(read_option health_check_rise 2)"
     CONNECTION_TIMEOUT="$(read_option connection_timeout 5)"
     PREFER_PROTOCOL="$(read_option prefer_protocol tcp)"
+    PRIMARY_RECOVERY_HOLD_SECS="$(read_option primary_recovery_hold_seconds 600)"
     LOG_LEVEL="$(read_option log_level info)"
     USB_DEVICE="$(read_option usb_device '')"
     USB_BAUD="$(read_option usb_baud 19200)"
@@ -115,6 +118,7 @@ load_config() {
     validate_pos_int "$CHECK_FALL"      health_check_fall
     validate_pos_int "$CHECK_RISE"      health_check_rise
     validate_pos_int "$CONNECTION_TIMEOUT" connection_timeout
+    validate_pos_int "$PRIMARY_RECOVERY_HOLD_SECS" primary_recovery_hold_seconds
     validate_pos_int "$USB_BAUD"        usb_baud
     [[ "$PRIMARY_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "primary_protocol must be one of: tcp, udp, auto"
     [[ "$BACKUP_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "backup_protocol must be one of: tcp, udp, auto"
@@ -127,6 +131,14 @@ load_config() {
         PRIMARY_PROTOCOL="tcp"
         BACKUP_PROTOCOL="udp"
     fi
+}
+
+set_primary_holdoff() {
+    local reason="${1:-primary-unstable}"
+    local now
+    now="$(date +%s)"
+    PRIMARY_HOLD_UNTIL=$(( now + PRIMARY_RECOVERY_HOLD_SECS ))
+    log_warn "Holding primary recovery for ${PRIMARY_RECOVERY_HOLD_SECS}s (${reason})"
 }
 
 select_backend_proto() {
@@ -533,6 +545,7 @@ enter_primary() {
     PRIMARY_FAIL_COUNT=0; PRIMARY_RISE_COUNT=0; BACKUP_FAIL_COUNT=0
     PRIMARY_CONNECT_REJECT_COUNT=0
     PRIMARY_TCP_RETRY_DONE=0
+    PRIMARY_HOLD_UNTIL=0
     stop_bridge
     set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "$proto"
     reload_proxy
@@ -658,6 +671,7 @@ tick_primary() {
         fi
 
         log_warn "Primary tunnel hard-reject detected (${rej_status}) — failing over now"
+        set_primary_holdoff "hard-reject-${rej_status}"
         enter_backup_fast
         return 0
     fi
@@ -684,6 +698,7 @@ tick_primary() {
                 fi
 
                 log_warn "Primary reachable but not tunnel-usable — failing over"
+                set_primary_holdoff "repeated-reject-${rej_status}"
                 enter_backup_fast
                 return 0
             fi
@@ -715,17 +730,26 @@ tick_backup() {
         return 0
     fi
 
-    local proto
-    proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
-    if [[ "$proto" != "none" ]]; then
-        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
-        PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
-        log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
-        if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
-            log_notice "Primary recovered"; enter_primary "$proto"; return 0; fi
-    else
-        [[ "$PRIMARY_RISE_COUNT" -gt 0 ]] && log_debug "Primary recovery reset"
+    local now
+    now="$(date +%s)"
+    if [[ "$now" -lt "$PRIMARY_HOLD_UNTIL" ]]; then
+        local remain
+        remain=$(( PRIMARY_HOLD_UNTIL - now ))
+        log_debug "Primary recovery holdoff active (${remain}s remaining)"
         PRIMARY_RISE_COUNT=0
+    else
+        local proto
+        proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+        if [[ "$proto" != "none" ]]; then
+            proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+            PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
+            log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
+            if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
+                log_notice "Primary recovered"; enter_primary "$proto"; return 0; fi
+        else
+            [[ "$PRIMARY_RISE_COUNT" -gt 0 ]] && log_debug "Primary recovery reset"
+            PRIMARY_RISE_COUNT=0
+        fi
     fi
     local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$bproto" != "none" ]]; then
@@ -821,6 +845,7 @@ main() {
     [[ -n "$USB_DEVICE" ]] && \
         log_info "USB:      ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY})"
     log_info "Health:   interval=${CHECK_INTERVAL}s fall=${CHECK_FALL} rise=${CHECK_RISE}"
+    log_info "Recovery: primary_holdoff=${PRIMARY_RECOVERY_HOLD_SECS}s"
     log_info "Probe:    prefer_protocol=${PREFER_PROTOCOL} timeout=${CONNECTION_TIMEOUT}s"
 
     clear_backend
