@@ -14,7 +14,9 @@ COPY rootfs /
 COPY run.sh /
 COPY healthcheck.sh /
 RUN chmod a+x /run.sh /healthcheck.sh \
-    && chmod a+x /etc/services.d/knx-haproxy/run
+    && chmod a+x /etc/services.d/knx-haproxy/run \
+    && chmod a+x /etc/services.d/knx-haproxy/finish \
+    && chmod a+x /etc/cont-init.d/knx-haproxy.sh
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
