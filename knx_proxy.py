@@ -297,8 +297,20 @@ class KNXProxy:
             raw = bsock.recv(1024)
             return parse_frame(raw)
 
-        def build_connect_body(hpai_ip: str, hpai_port: int, hpai_proto: int, cri_value: bytes):
-            return make_hpai(hpai_ip, hpai_port, hpai_proto) + make_hpai(hpai_ip, hpai_port, hpai_proto) + cri_value
+        def build_connect_body(
+            ctrl_ip: str,
+            ctrl_port: int,
+            ctrl_proto: int,
+            data_ip: str,
+            data_port: int,
+            data_proto: int,
+            cri_value: bytes,
+        ):
+            return (
+                make_hpai(ctrl_ip, ctrl_port, ctrl_proto)
+                + make_hpai(data_ip, data_port, data_proto)
+                + cri_value
+            )
 
         resp_svc = None
         resp_body = None
@@ -306,11 +318,18 @@ class KNXProxy:
         try:
             if b_proto == 'tcp':
                 backend_cri = cri if cri else b'\x04\x04\x02\x00'
-                resp_svc, resp_body = do_connect_request(build_connect_body('0.0.0.0', 0, PROTO_TCP, backend_cri))
+                resp_svc, resp_body = do_connect_request(
+                    build_connect_body(
+                        '0.0.0.0', 0, PROTO_TCP,
+                        '0.0.0.0', 0, PROTO_TCP,
+                        backend_cri,
+                    )
+                )
             else:
                 # UDP backend compatibility matrix:
-                # some interfaces require concrete HPAI IP, some require 0.0.0.0,
-                # some prefer client CRI, some require classic tunneling CRI.
+                # Prefer standards-compliant endpoint combinations first.
+                # Many KNX/IP interfaces reject wildcard IP with non-zero port,
+                # and reject non-routable container IP as callback endpoint.
                 cri_client = cri if cri else b'\x04\x04\x02\x00'
                 # Interface compatibility set:
                 # 02 00 = tunneling v1 classic
@@ -323,23 +342,43 @@ class KNXProxy:
                     (b'\x04\x04\x02\x01', 'cri-0201'),
                 ]
 
-                # client_ctrl[0] is often the HAOS host IP visible on LAN.
-                # In containerized setups backend may not be able to route to b_local_ip
-                # (e.g. 172.x), so we also try the caller-visible host IP.
-                hpai_ips = []
-                for ip in (b_local_ip, client_ctrl[0], '0.0.0.0'):
-                    if ip not in hpai_ips:
-                        hpai_ips.append(ip)
-
                 attempts = []
-                for hpai_ip in hpai_ips:
+                hpai_variants_udp = [
+                    ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', 0, PROTO_UDP, 'nat-both-zero/udp'),
+                    ('0.0.0.0', 0, PROTO_UDP, b_local_ip, b_local_port, PROTO_UDP, f'ctrl-zero+data-local({b_local_ip}:{b_local_port})/udp'),
+                    (b_local_ip, b_local_port, PROTO_UDP, b_local_ip, b_local_port, PROTO_UDP, f'local-both({b_local_ip}:{b_local_port})/udp'),
+                    ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', b_local_port, PROTO_UDP, f'ctrl-zero+data-wildcard-port({b_local_port})/udp'),
+                ]
+
+                for ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto, hpai_label in hpai_variants_udp:
                     for cri_try, cri_label in cri_variants_udp:
-                        attempts.append((hpai_ip, b_local_port, PROTO_UDP, cri_try, f'{hpai_ip}:{b_local_port}/udp + {cri_label}'))
+                        attempts.append(
+                            (
+                                ctrl_ip,
+                                ctrl_port,
+                                ctrl_proto,
+                                data_ip,
+                                data_port,
+                                data_proto,
+                                cri_try,
+                                f'{hpai_label} + {cri_label}',
+                            )
+                        )
 
                 last_status = None
-                for hpai_ip, hpai_port, hpai_proto, cri_try, label in attempts:
+                for ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto, cri_try, label in attempts:
                     try:
-                        resp_svc, resp_body = do_connect_request(build_connect_body(hpai_ip, hpai_port, hpai_proto, cri_try))
+                        resp_svc, resp_body = do_connect_request(
+                            build_connect_body(
+                                ctrl_ip,
+                                ctrl_port,
+                                ctrl_proto,
+                                data_ip,
+                                data_port,
+                                data_proto,
+                                cri_try,
+                            )
+                        )
                     except socket.timeout:
                         log.warning(f"Backend CONNECT attempt timed out ({label})")
                         continue
@@ -371,11 +410,6 @@ class KNXProxy:
                         b_local_ip, b_local_port = bsock.getsockname()[0], bsock.getsockname()[1]
                         b_hpai_proto = PROTO_TCP
 
-                        hpai_ips_tcp = []
-                        for ip in (b_local_ip, client_ctrl[0], '0.0.0.0'):
-                            if ip not in hpai_ips_tcp:
-                                hpai_ips_tcp.append(ip)
-
                         cri_variants = [
                             (cri if cri else b'\x04\x04\x02\x00', 'client-cri'),
                             (b'\x04\x04\x02\x00', 'cri-v1-0200'),
@@ -385,31 +419,48 @@ class KNXProxy:
 
                         tcp_attempts = []
                         hpai_variants_tcp = [
-                            ('0.0.0.0', 0, PROTO_TCP, 'wildcard:0/tcp'),
-                            ('0.0.0.0', 0, PROTO_UDP, 'wildcard:0/udp'),
-                            (client_ctrl[0], 0, PROTO_TCP, 'client-ip:0/tcp'),
-                            (client_ctrl[0], b_local_port, PROTO_TCP, f'client-ip:{b_local_port}/tcp'),
-                            (b_local_ip, b_local_port, PROTO_TCP, f'local-ip:{b_local_port}/tcp'),
-                            ('0.0.0.0', b_local_port, PROTO_TCP, f'wildcard:{b_local_port}/tcp'),
+                            ('0.0.0.0', 0, PROTO_TCP, '0.0.0.0', 0, PROTO_TCP, 'tcp-both-zero/tcp'),
+                            ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', 0, PROTO_UDP, 'tcp-both-zero/udp'),
+                            ('0.0.0.0', 0, PROTO_TCP, b_local_ip, b_local_port, PROTO_TCP, f'tcp-ctrl-zero+data-local({b_local_ip}:{b_local_port})/tcp'),
+                            (b_local_ip, b_local_port, PROTO_TCP, b_local_ip, b_local_port, PROTO_TCP, f'tcp-local-both({b_local_ip}:{b_local_port})/tcp'),
                         ]
-                        for hpai_ip in hpai_ips_tcp:
+                        for ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto, hpai_label in hpai_variants_tcp:
                             for cri_try, cri_label in cri_variants:
-                                for var_ip, var_port, var_proto, var_label in hpai_variants_tcp:
-                                    chosen_ip = hpai_ip if var_ip == client_ctrl[0] else var_ip
-                                    tcp_attempts.append((chosen_ip, var_port, var_proto, cri_try, f'{var_label} + {cri_label}'))
+                                tcp_attempts.append(
+                                    (
+                                        ctrl_ip,
+                                        ctrl_port,
+                                        ctrl_proto,
+                                        data_ip,
+                                        data_port,
+                                        data_proto,
+                                        cri_try,
+                                        f'{hpai_label} + {cri_label}',
+                                    )
+                                )
 
                         seen = set()
                         deduped = []
                         for item in tcp_attempts:
-                            key = (item[0], item[1], item[2], item[3])
+                            key = (item[0], item[1], item[2], item[3], item[4], item[5], item[6])
                             if key in seen:
                                 continue
                             seen.add(key)
                             deduped.append(item)
 
-                        for hpai_ip, hpai_port, hpai_proto, cri_try, label in deduped:
+                        for ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto, cri_try, label in deduped:
                             try:
-                                resp_svc, resp_body = do_connect_request(build_connect_body(hpai_ip, hpai_port, hpai_proto, cri_try))
+                                resp_svc, resp_body = do_connect_request(
+                                    build_connect_body(
+                                        ctrl_ip,
+                                        ctrl_port,
+                                        ctrl_proto,
+                                        data_ip,
+                                        data_port,
+                                        data_proto,
+                                        cri_try,
+                                    )
+                                )
                             except socket.timeout:
                                 log.warning(f"Backend CONNECT attempt timed out ({label})")
                                 continue
