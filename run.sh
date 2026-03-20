@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.19"
+readonly VERSION="2.6.20"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -30,6 +30,7 @@ readonly STATE_DEGRADED="DEGRADED"
 
 PRIMARY_HOST="" PRIMARY_PORT=""
 BACKUP_HOST=""  BACKUP_PORT=""
+PRIMARY_PROTOCOL="" BACKUP_PROTOCOL=""
 LISTEN_PORT=""  UDP_BRIDGE_PORT=""
 USB_DEVICE=""   USB_BAUD=""
 CHECK_INTERVAL="" CHECK_FALL="" CHECK_RISE=""
@@ -86,8 +87,10 @@ load_config() {
     [[ -f "$OPTIONS_FILE" ]] || die "Missing $OPTIONS_FILE"
     PRIMARY_HOST="$(read_option primary_host '')"
     PRIMARY_PORT="$(read_option primary_port 3671)"
+    PRIMARY_PROTOCOL="$(read_option primary_protocol auto)"
     BACKUP_HOST="$(read_option backup_host '')"
     BACKUP_PORT="$(read_option backup_port 3671)"
+    BACKUP_PROTOCOL="$(read_option backup_protocol auto)"
     LISTEN_PORT="$(read_option listen_port 3672)"
     UDP_BRIDGE_PORT="$(read_option udp_bridge_port 13671)"
     CHECK_INTERVAL="$(read_option health_check_interval 5)"
@@ -113,8 +116,19 @@ load_config() {
     validate_pos_int "$CHECK_RISE"      health_check_rise
     validate_pos_int "$CONNECTION_TIMEOUT" connection_timeout
     validate_pos_int "$USB_BAUD"        usb_baud
+    [[ "$PRIMARY_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "primary_protocol must be one of: tcp, udp, auto"
+    [[ "$BACKUP_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "backup_protocol must be one of: tcp, udp, auto"
     [[ "$PREFER_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "prefer_protocol must be one of: tcp, udp, auto"
     [[ "$LISTEN_PORT" != "$UDP_BRIDGE_PORT" ]] || die "listen_port and udp_bridge_port must differ"
+}
+
+select_backend_proto() {
+    local detected="$1" forced="$2"
+    if [[ "$forced" == "tcp" || "$forced" == "udp" ]]; then
+        echo "$forced"
+    else
+        echo "$detected"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -536,7 +550,8 @@ enter_backup() {
 enter_backup_fast() {
     # Runtime emergency path: if active backend hard-rejects CONNECT,
     # move traffic to backup immediately and let live traffic validate it.
-    local proto="udp"
+    local proto
+    proto="$(select_backend_proto udp "$BACKUP_PROTOCOL")"
     log_notice "→ BACKUP-FAST (${BACKUP_HOST}:${BACKUP_PORT} [${proto}])"
     CURRENT_STATE="$STATE_BACKUP"
     BACKUP_FAIL_COUNT=0
@@ -587,11 +602,13 @@ initial_probe() {
     local proto
     proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
+        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
         log_info "Primary: OK [${proto}]"; enter_primary "$proto"; return; fi
     log_warn "Primary probe failed (${PRIMARY_HOST}:${PRIMARY_PORT})"
 
     proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$proto" != "none" ]]; then
+        proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
         log_info "Backup: OK [${proto}]"; enter_backup "$proto"; return; fi
     log_warn "Backup probe failed (${BACKUP_HOST}:${BACKUP_PORT})"
 
@@ -641,6 +658,7 @@ tick_primary() {
     local proto
     proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
+        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
         rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
         if [[ -n "$rej_status" ]]; then
             PRIMARY_CONNECT_REJECT_COUNT=$((PRIMARY_CONNECT_REJECT_COUNT + 1))
@@ -672,7 +690,9 @@ tick_primary() {
     if [[ "$PRIMARY_FAIL_COUNT" -ge "$CHECK_FALL" ]]; then
         log_warn "Primary failed — initiating failover"
         local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-        if [[ "$bproto" != "none" ]]; then enter_backup "$bproto"
+        if [[ "$bproto" != "none" ]]; then
+            bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
+            enter_backup "$bproto"
         elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
         else enter_degraded "primary-failed-no-backup"; fi
     fi; return 0
@@ -691,6 +711,7 @@ tick_backup() {
     local proto
     proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
+        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
         PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
         log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
         if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
@@ -701,6 +722,7 @@ tick_backup() {
     fi
     local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$bproto" != "none" ]]; then
+        bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
         rej_status="$(read_backend_reject_status "$BACKUP_HOST" "$BACKUP_PORT")"
         if [[ -n "$rej_status" ]]; then
             BACKUP_CONNECT_REJECT_COUNT=$((BACKUP_CONNECT_REJECT_COUNT + 1))
@@ -728,9 +750,11 @@ tick_backup() {
 tick_usb() {
     local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
+        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
         log_notice "Primary recovered (from USB)"; enter_primary "$proto"; return 0; fi
     proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$proto" != "none" ]]; then
+        proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
         log_notice "Backup recovered (from USB)"; enter_backup "$proto"; return 0; fi
     if [[ -n "$SOCAT_PID" ]] && ! kill -0 "$SOCAT_PID" 2>/dev/null; then
         if ! usb_probe "$USB_DEVICE"; then
@@ -748,9 +772,11 @@ tick_degraded() {
     log_debug "DEGRADED: retrying all interfaces..."
     local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
+        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
         log_notice "Primary back [${proto}]"; enter_primary "$proto"; return 0; fi
     proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$proto" != "none" ]]; then
+        proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
         log_notice "Backup back [${proto}]"; enter_backup "$proto"; return 0; fi
     if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
         log_notice "USB available"; enter_usb; return 0; fi
@@ -783,6 +809,7 @@ main() {
 
     log_info "Primary:  ${PRIMARY_HOST}:${PRIMARY_PORT}"
     log_info "Backup:   ${BACKUP_HOST}:${BACKUP_PORT}"
+    log_info "Backend protocol pin: primary=${PRIMARY_PROTOCOL} backup=${BACKUP_PROTOCOL}"
     log_info "Listen:   0.0.0.0:${LISTEN_PORT} (TCP + UDP)"
     [[ -n "$USB_DEVICE" ]] && \
         log_info "USB:      ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY})"

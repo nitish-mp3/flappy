@@ -5,7 +5,7 @@ description: >
   KNX/IP failover proxy with full KNX/IP front-end support (UDP + TCP)
   and automatic backend failover. Supports TCP/IP, UDP/IP, and USB/serial
   interfaces with monitored recovery and seamless reconnect behavior.
-version: "2.6.19"
+version: "2.6.20"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -25,8 +25,10 @@ ports:
 options:
   primary_host: ""
   primary_port: 3671
+  primary_protocol: auto
   backup_host: ""
   backup_port: 3671
+  backup_protocol: auto
   usb_device: ""
   usb_baud: 19200
   usb_priority: last_resort
@@ -43,8 +45,10 @@ options:
 schema:
   primary_host: str
   primary_port: port
+  primary_protocol: list(tcp|udp|auto)?
   backup_host: str
   backup_port: port
+  backup_protocol: list(tcp|udp|auto)?
   usb_device: str?
   usb_baud: int(1200,)?
   usb_priority: list(last_resort|prefer)?
