@@ -1,6 +1,7 @@
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
+# haproxy removed — Python proxy handles the full KNX/IP UDP tunnel protocol
 RUN apk add --no-cache \
     socat \
     jq \
