@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.5"
+VERSION      = "2.6.6"
 BACKEND_FILE = "/run/knx-active-backend"
 MAGIC        = b'\x06\x10'
 
@@ -345,6 +345,47 @@ class KNXProxy:
 
                     last_status = status_try
                     log.warning(f"Backend CONNECT rejected ({label}) status=0x{status_try:02x}")
+
+                # Some interfaces advertise UDP discovery but reject UDP tunneling
+                # options with 0x22. In that case, retry tunnel establishment over
+                # TCP to the same backend endpoint before failing the client connect.
+                if last_status == 0x22:
+                    log.warning("UDP backend CONNECT rejected with 0x22; trying TCP backend fallback")
+                    try:
+                        bsock.close()
+                    except Exception:
+                        pass
+
+                    try:
+                        bsock = self._open_backend(b_host, b_port, 'tcp')
+                        b_proto = 'tcp'
+                        b_local_ip, b_local_port = bsock.getsockname()[0], bsock.getsockname()[1]
+                        b_hpai_proto = PROTO_TCP
+
+                        tcp_attempts = [
+                            (cri if cri else b'\x04\x04\x02\x00', 'tcp + client-cri'),
+                            (b'\x04\x04\x02\x00', 'tcp + cri-v1'),
+                        ]
+                        for cri_try, label in tcp_attempts:
+                            try:
+                                resp_svc, resp_body = do_connect_request(build_connect_body(b_local_ip, cri_try))
+                            except socket.timeout:
+                                log.warning(f"Backend CONNECT attempt timed out ({label})")
+                                continue
+
+                            if resp_svc != CONNECT_RESP or not resp_body or len(resp_body) < 2:
+                                continue
+
+                            status_try = resp_body[1]
+                            if status_try == 0x00:
+                                log.info(f"Backend CONNECT accepted ({label})")
+                                last_status = 0x00
+                                break
+
+                            last_status = status_try
+                            log.warning(f"Backend CONNECT rejected ({label}) status=0x{status_try:02x}")
+                    except Exception as e:
+                        log.warning(f"TCP backend fallback failed: {e}")
 
                 if (resp_svc != CONNECT_RESP) or (not resp_body) or (len(resp_body) < 2):
                     if last_status is not None:
