@@ -20,7 +20,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.4.0"
+readonly VERSION="2.5.0"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -165,6 +165,10 @@ clear_backend() {
 # ---------------------------------------------------------------------------
 start_proxy() {
     stop_proxy
+    # Kill any stale knx_proxy.py from a previous run that didn't clean up
+    # (e.g. if the container was killed with SIGKILL instead of SIGTERM)
+    pkill -f "knx_proxy.py" 2>/dev/null || true
+    sleep 1
     log_info "Starting KNX/IP proxy on port ${LISTEN_PORT} (TCP + UDP)"
     LOG_LEVEL="$LOG_LEVEL" python3 /knx_proxy.py "$LISTEN_PORT" &
     PROXY_PID="$!"

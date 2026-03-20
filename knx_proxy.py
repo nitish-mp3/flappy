@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-KNX/IP Failover Proxy  v2.4.0
+KNX/IP Failover Proxy  v2.5.0
 
-Handles ALL four protocol combinations transparently:
-  client UDP → backend UDP   (your .95 device)
-  client UDP → backend TCP   (your .212 device via xknx UDP mode)
-  client TCP → backend UDP   (protocol translation)
-  client TCP → backend TCP   (your .212 device via xknx TCP mode)
-
-Listens on both TCP and UDP on the same port.
-Backend is read from /run/knx-active-backend (format: host:port:proto).
-SIGHUP → drop all sessions so HA reconnects to the new backend.
+- Listens on TCP and UDP on the same port
+- Routes to backend (host:port:proto) from /run/knx-active-backend
+- SIGHUP drops all sessions so HA reconnects to new backend on failover
+- Handles all 4 combos: UDP client↔UDP backend, UDP↔TCP, TCP↔UDP, TCP↔TCP
 """
 
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION = "2.4.0"
+VERSION      = "2.5.0"
 BACKEND_FILE = "/run/knx-active-backend"
 MAGIC        = b'\x06\x10'
 
@@ -56,7 +51,7 @@ def make_hpai(ip: str, port: int, proto: int = PROTO_UDP) -> bytes:
         return bytes([8, proto]) + b'\x00\x00\x00\x00' + struct.pack('>H', port)
 
 def parse_hpai(data: bytes, off: int) -> Tuple[str, int, int, int]:
-    """Returns (ip, port, proto, next_offset)."""
+    """Returns (ip, port, proto_byte, next_offset)."""
     if off + 8 > len(data):
         return '0.0.0.0', 0, PROTO_UDP, off + 8
     length = data[off]
@@ -99,12 +94,21 @@ def read_tcp_frame(sock: socket.socket) -> Tuple[Optional[int], Optional[bytes]]
         return None, None
     return svc, body
 
+def tunnel_channel_id(body: bytes) -> int:
+    """
+    KNX TUNNELLING structure:
+      body[0] = header length (04)
+      body[1] = reserved     (00)
+      body[2] = channel_id   <-- this is what we want
+      body[3] = seq_counter
+    """
+    return body[2] if len(body) >= 4 else 0
+
 
 # ---------------------------------------------------------------------------
-# Backend config
+# Backend
 # ---------------------------------------------------------------------------
 def read_backend() -> Optional[Tuple[str, int, str]]:
-    """Read /run/knx-active-backend → (host, port, 'tcp'|'udp') or None."""
     try:
         line = open(BACKEND_FILE).read().strip()
         if not line or line == 'none':
@@ -120,18 +124,20 @@ def read_backend() -> Optional[Tuple[str, int, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Pre-built DESCRIPTION_RESPONSE — advertises UDP v1 AND TCP v2
-# xknx will pick whichever mode the user configured in HA
+# DESCRIPTION_RESPONSE — advertises both UDP v1 and TCP v2
+# xknx picks based on user setting in HA
 # ---------------------------------------------------------------------------
 def _build_description_response() -> bytes:
     name = b'KNX Failover Proxy\x00'
     name = name + bytes(30 - len(name))
     dib1 = (
-        b'\x36\x01\x02\x00'           # len=54, DEVICE_INFO, medium=TP, status=OK
-        b'\xff\x00\x00\x00'           # individual addr 15.15.0, project id 0
-        b'\xaa\xbb\xcc\x00\x01\x02'  # serial
-        b'\xe0\x00\x17\x0c'           # multicast 224.0.23.12
-        b'\x00\x00\x00\x00\x00\x00'  # MAC
+        b'\x36\x01'                          # len=54, DEVICE_INFO
+        b'\x02\x00'                          # medium=TP, status=OK
+        b'\xff\x00'                          # individual addr 15.15.0
+        b'\x00\x00'                          # project install id
+        b'\xaa\xbb\xcc\x00\x01\x02'         # serial
+        b'\xe0\x00\x17\x0c'                  # multicast 224.0.23.12
+        b'\x00\x00\x00\x00\x00\x00'         # MAC
     ) + name
     dib2 = (
         b'\x0a\x02'   # len=10, SUPPORTED_SERVICE_FAMILIES
@@ -149,18 +155,9 @@ DESCRIPTION_RESPONSE = _build_description_response()
 # Session
 # ---------------------------------------------------------------------------
 class Session:
-    __slots__ = [
-        'channel_id',
-        'client_type',    # 'udp' or 'tcp'
-        'client_ctrl',    # (ip, port) for UDP clients; src addr for TCP
-        'client_data',    # (ip, port) for UDP data endpoint
-        'client_sock',    # TCP socket for TCP clients; None for UDP
-        'backend_type',   # 'udp' or 'tcp'
-        'backend_addr',   # (ip, port)
-        'backend_sock',   # socket toward backend
-        'last_seen',
-        'alive',
-    ]
+    __slots__ = ['channel_id', 'client_type', 'client_ctrl', 'client_data',
+                 'client_sock', 'backend_type', 'backend_addr',
+                 'backend_sock', 'last_seen', 'alive']
 
     def __init__(self, channel_id, client_type, client_ctrl, client_data,
                  client_sock, backend_type, backend_addr, backend_sock):
@@ -202,37 +199,39 @@ class KNXProxy:
 
     def __init__(self, port: int):
         self.port     = port
-        self.sessions = {}          # channel_id → Session
+        self.sessions = {}
         self.lock     = threading.Lock()
         self.running  = True
 
-        # UDP socket — client-facing and backend-facing for UDP backends
+        # UDP socket — NO SO_REUSEPORT (avoids packet splitting with stale procs)
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try: self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except AttributeError: pass
         self.udp.bind(('0.0.0.0', port))
         self.udp.settimeout(2.0)
+        log.info(f"UDP socket bound to 0.0.0.0:{port}")
 
-        # TCP server socket
+        # TCP server socket — SO_REUSEADDR only
         self.tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try: self.tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except AttributeError: pass
         self.tcp_srv.bind(('0.0.0.0', port))
         self.tcp_srv.listen(8)
         self.tcp_srv.settimeout(2.0)
+        log.info(f"TCP socket bound to 0.0.0.0:{port}")
 
         signal.signal(signal.SIGHUP,  self._on_sighup)
         signal.signal(signal.SIGTERM, self._on_stop)
         signal.signal(signal.SIGINT,  self._on_stop)
-        log.info(f"KNX/IP proxy v{VERSION} — port {port} (TCP + UDP)")
+        log.info(f"KNX/IP proxy v{VERSION} — port {port} (TCP+UDP) ready")
 
     # ------------------------------------------------------------------
     # Signals
     # ------------------------------------------------------------------
     def _on_sighup(self, *_):
-        log.info("SIGHUP: backend changed — dropping all sessions")
+        # Run in a thread to avoid signal handler / lock interaction
+        threading.Thread(target=self._do_sighup, daemon=True).start()
+
+    def _do_sighup(self):
+        log.info("Backend changed — dropping all sessions")
         with self.lock:
             sessions, self.sessions = list(self.sessions.values()), {}
         for sess in sessions:
@@ -248,50 +247,55 @@ class KNXProxy:
             frame = make_frame(DISCONNECT_REQ, body)
             if sess.client_type == 'tcp' and sess.client_sock:
                 sess.client_sock.sendall(frame)
-            else:
+            elif sess.client_ctrl:
                 self.udp.sendto(frame, sess.client_ctrl)
-        except Exception: pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
-    # Session factory — shared by UDP and TCP client paths
+    # Backend connection
     # ------------------------------------------------------------------
-    def _open_backend_socket(self, b_host, b_port, b_proto):
-        if b_proto == 'tcp':
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            s.connect((b_host, b_port))
-            return s
-        else:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(5.0)
-            s.bind(('0.0.0.0', 0))
-            return s
+    def _open_backend(self, host: str, port: int, proto: str) -> Optional[socket.socket]:
+        try:
+            if proto == 'tcp':
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5.0)
+                s.connect((host, port))
+                return s
+            else:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(5.0)
+                s.bind(('0.0.0.0', 0))
+                return s
+        except Exception as e:
+            log.error(f"Cannot connect to backend {host}:{port} [{proto}]: {e}")
+            return None
 
     def _create_session(self, client_type: str, client_ctrl: tuple,
                         client_data: tuple, client_sock,
-                        connect_body: bytes) -> bool:
+                        connect_body: bytes):
         backend = read_backend()
         if backend is None:
-            log.warning("No backend available — rejecting CONNECT_REQUEST")
+            log.warning("No backend — rejecting CONNECT")
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
-            return False
+            return
 
         b_host, b_port, b_proto = backend
+        log.info(f"CONNECT from {client_type.upper()} {client_ctrl[0]}:{client_ctrl[1]}"
+                 f" → backend {b_proto.upper()} {b_host}:{b_port}")
 
-        try:
-            bsock = self._open_backend_socket(b_host, b_port, b_proto)
-        except Exception as e:
-            log.error(f"Cannot connect to backend {b_host}:{b_port} [{b_proto}]: {e}")
+        bsock = self._open_backend(b_host, b_port, b_proto)
+        if bsock is None:
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
-            return False
+            return
 
         b_local_port = bsock.getsockname()[1]
         b_hpai_proto = PROTO_TCP if b_proto == 'tcp' else PROTO_UDP
 
-        # Rewrite CONNECT_REQUEST HPAIs — replace client addresses with ours
-        _, _, _, off1 = parse_hpai(connect_body, 0)   # skip ctrl HPAI
-        _, _, _, off2 = parse_hpai(connect_body, off1) # skip data HPAI
-        cri = connect_body[off2:]
+        # Skip client HPAIs, keep CRI
+        _, _, _, off = parse_hpai(connect_body, 0)
+        _, _, _, off = parse_hpai(connect_body, off)
+        cri = connect_body[off:]
 
         new_body  = (make_hpai('0.0.0.0', b_local_port, b_hpai_proto) +
                      make_hpai('0.0.0.0', b_local_port, b_hpai_proto) + cri)
@@ -306,40 +310,37 @@ class KNXProxy:
                 raw, _ = bsock.recvfrom(1024)
                 resp_svc, resp_body = parse_frame(raw)
         except socket.timeout:
-            log.error(f"Backend {b_host}:{b_port} CONNECT timeout")
+            log.error(f"Backend CONNECT timeout {b_host}:{b_port}")
             bsock.close()
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
-            return False
+            return
         except Exception as e:
             log.error(f"Backend CONNECT error: {e}")
             bsock.close()
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
-            return False
+            return
 
         if resp_svc != CONNECT_RESP or not resp_body or len(resp_body) < 10:
-            log.error(f"Bad backend CONNECT_RESPONSE svc={resp_svc}")
+            log.error(f"Bad CONNECT_RESP from backend svc=0x{resp_svc:04x if resp_svc else 0}")
             bsock.close()
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
-            return False
+            return
 
         ch_id  = resp_body[0]
         status = resp_body[1]
 
         if status != 0x00:
-            log.warning(f"Backend rejected connection status=0x{status:02x}")
+            log.warning(f"Backend refused: status=0x{status:02x}")
             bsock.close()
-            frame = make_frame(CONNECT_RESP, resp_body)
-            self._send_to_client_raw(frame, client_type, client_ctrl, client_sock)
-            return False
+            self._send_raw(make_frame(CONNECT_RESP, resp_body), client_type, client_ctrl, client_sock)
+            return
 
-        # Extract CRD (Connection Response Data) from backend response
         _, _, _, r_off = parse_hpai(resp_body, 2)
         crd = resp_body[r_off:]
 
-        # Build CONNECT_RESPONSE for client — point data HPAI to our proxy port
-        c_hpai_proto = PROTO_TCP if client_type == 'tcp' else PROTO_UDP
-        client_resp  = bytes([ch_id, 0x00]) + make_hpai('0.0.0.0', self.port, c_hpai_proto) + crd
-        client_frame = make_frame(CONNECT_RESP, client_resp)
+        c_proto   = PROTO_TCP if client_type == 'tcp' else PROTO_UDP
+        c_resp    = bytes([ch_id, 0x00]) + make_hpai('0.0.0.0', self.port, c_proto) + crd
+        c_frame   = make_frame(CONNECT_RESP, c_resp)
 
         sess = Session(
             channel_id=ch_id,
@@ -351,30 +352,25 @@ class KNXProxy:
             backend_addr=(b_host, b_port),
             backend_sock=bsock,
         )
+
         with self.lock:
             old = self.sessions.pop(ch_id, None)
             if old: old.close()
             self.sessions[ch_id] = sess
 
-        # Start backend→client relay thread
-        threading.Thread(
-            target=self._relay_from_backend,
-            args=(sess,), daemon=True,
-            name=f"relay-{ch_id}"
-        ).start()
+        threading.Thread(target=self._relay_from_backend, args=(sess,),
+                         daemon=True, name=f"relay-{ch_id}").start()
 
-        # Send CONNECT_RESPONSE to client
-        if not self._send_to_client_raw(client_frame, client_type, client_ctrl, client_sock):
-            with self.lock:
-                self.sessions.pop(ch_id, None)
+        if not self._send_raw(c_frame, client_type, client_ctrl, client_sock):
+            with self.lock: self.sessions.pop(ch_id, None)
             sess.close()
-            return False
+            return
 
-        log.info(f"Session {ch_id}: {client_type.upper()} {client_ctrl[0]}:{client_ctrl[1]}"
-                 f" ↔ {b_proto.upper()} {b_host}:{b_port}")
-        return True
+        log.info(f"Session {ch_id} established: "
+                 f"{client_type.upper()} {client_ctrl[0]}:{client_ctrl[1]} "
+                 f"↔ {b_proto.upper()} {b_host}:{b_port}")
 
-    def _send_to_client_raw(self, frame, ctype, ctrl, csock) -> bool:
+    def _send_raw(self, frame, ctype, ctrl, csock) -> bool:
         try:
             if ctype == 'tcp' and csock:
                 csock.sendall(frame)
@@ -382,16 +378,15 @@ class KNXProxy:
                 self.udp.sendto(frame, ctrl)
             return True
         except Exception as e:
-            log.debug(f"_send_to_client_raw: {e}")
+            log.debug(f"_send_raw: {e}")
             return False
 
     def _send_connect_error(self, ctype, ctrl, csock, code):
         body  = bytes([0x00, code]) + make_hpai('0.0.0.0', 0) + b'\x04\x04\x00\x00'
-        frame = make_frame(CONNECT_RESP, body)
-        self._send_to_client_raw(frame, ctype, ctrl, csock)
+        self._send_raw(make_frame(CONNECT_RESP, body), ctype, ctrl, csock)
 
     # ------------------------------------------------------------------
-    # Backend → client relay  (one thread per session)
+    # Backend → client relay
     # ------------------------------------------------------------------
     def _relay_from_backend(self, sess: Session):
         while sess.alive and self.running:
@@ -421,10 +416,9 @@ class KNXProxy:
             dest = sess.client_data or sess.client_ctrl
 
             if svc in (TUNNELLING_REQ, TUNNELLING_ACK, CONNSTATE_RESP, DISCONNECT_RESP):
-                self._send_to_client_raw(data, sess.client_type, dest, sess.client_sock)
-
+                self._send_raw(data, sess.client_type, dest, sess.client_sock)
             elif svc == DISCONNECT_REQ:
-                self._send_to_client_raw(data, sess.client_type, sess.client_ctrl, sess.client_sock)
+                self._send_raw(data, sess.client_type, sess.client_ctrl, sess.client_sock)
                 ack = bytes([sess.channel_id, 0x00]) + make_hpai('0.0.0.0', 0)
                 sess.send_to_backend(make_frame(DISCONNECT_RESP, ack))
                 with self.lock: self.sessions.pop(sess.channel_id, None)
@@ -437,58 +431,67 @@ class KNXProxy:
             sess.close()
 
     # ------------------------------------------------------------------
-    # UDP dispatch loop
+    # UDP dispatch
     # ------------------------------------------------------------------
     def _dispatch_udp(self, data: bytes, addr: tuple):
         svc, body = parse_frame(data)
         if svc is None:
+            log.debug(f"Unparseable UDP from {addr[0]}:{addr[1]} ({len(data)}B)")
             return
+
+        log.debug(f"UDP svc=0x{svc:04x} from {addr[0]}:{addr[1]}")
 
         if svc == DESCRIPTION_REQ:
             log.info(f"DESCRIPTION_REQUEST from {addr[0]}:{addr[1]}")
-            try: self.udp.sendto(DESCRIPTION_RESPONSE, addr)
-            except Exception as e: log.error(f"DESCRIPTION_RESPONSE: {e}")
+            try:
+                self.udp.sendto(DESCRIPTION_RESPONSE, addr)
+            except Exception as e:
+                log.error(f"DESCRIPTION_RESPONSE failed: {e}")
 
         elif svc == CONNECT_REQ:
-            if not body or len(body) < 16: return
+            if not body or len(body) < 16:
+                return
             ci, cp, _, off = parse_hpai(body, 0)
             di, dp, _, _   = parse_hpai(body, off)
             ci = ci if ci != '0.0.0.0' else addr[0]
             di = di if di != '0.0.0.0' else addr[0]
             cp = cp if cp != 0 else addr[1]
             dp = dp if dp != 0 else addr[1]
-            threading.Thread(
-                target=self._create_session,
-                args=('udp', (ci, cp), (di, dp), None, body),
-                daemon=True
-            ).start()
+            threading.Thread(target=self._create_session,
+                             args=('udp', (ci, cp), (di, dp), None, body),
+                             daemon=True).start()
 
         elif svc in (TUNNELLING_REQ, TUNNELLING_ACK):
-            if not body or len(body) < 4: return
-            ch = body[1]
-            with self.lock: sess = self.sessions.get(ch)
+            if not body or len(body) < 4:
+                return
+            ch = tunnel_channel_id(body)   # body[2]
+            with self.lock:
+                sess = self.sessions.get(ch)
             if sess and sess.alive:
                 sess.last_seen = time.monotonic()
                 sess.send_to_backend(data)
 
         elif svc == CONNSTATE_REQ:
-            if not body: return
+            if not body:
+                return
             ch = body[0]
-            with self.lock: sess = self.sessions.get(ch)
+            with self.lock:
+                sess = self.sessions.get(ch)
             if sess and sess.alive:
                 sess.last_seen = time.monotonic()
                 sess.send_to_backend(data)
 
         elif svc in (DISCONNECT_REQ, DISCONNECT_RESP):
             ch = body[0] if body else 0
-            with self.lock: sess = self.sessions.pop(ch, None)
+            with self.lock:
+                sess = self.sessions.pop(ch, None)
             if sess:
                 sess.send_to_backend(data)
                 log.info(f"Session {ch} disconnected by UDP client")
                 sess.close()
 
     # ------------------------------------------------------------------
-    # TCP client handler  (one thread per connection)
+    # TCP client handler
     # ------------------------------------------------------------------
     def _handle_tcp_client(self, sock: socket.socket, addr: tuple):
         log.info(f"TCP client connected: {addr[0]}:{addr[1]}")
@@ -500,35 +503,49 @@ class KNXProxy:
                 if svc is None:
                     break
 
-                if svc == CONNECT_REQ:
-                    if not body or len(body) < 16: break
+                log.debug(f"TCP svc=0x{svc:04x} from {addr[0]}:{addr[1]}")
+
+                if svc == DESCRIPTION_REQ:
+                    log.info(f"TCP DESCRIPTION_REQUEST from {addr[0]}:{addr[1]}")
+                    try:
+                        sock.sendall(DESCRIPTION_RESPONSE)
+                    except Exception as e:
+                        log.error(f"TCP DESCRIPTION_RESPONSE failed: {e}")
+                        break
+
+                elif svc == CONNECT_REQ:
                     ctrl = (addr[0], addr[1])
-                    ok = self._create_session('tcp', ctrl, ctrl, sock, body)
-                    if not ok: break
+                    self._create_session('tcp', ctrl, ctrl, sock, body)
                     with self.lock:
                         for ch, s in self.sessions.items():
                             if s.client_sock is sock:
-                                ch_id = ch; break
+                                ch_id = ch
+                                break
 
                 elif svc in (TUNNELLING_REQ, TUNNELLING_ACK):
-                    if not body or len(body) < 4: continue
-                    ch = body[1]
-                    with self.lock: sess = self.sessions.get(ch)
+                    if not body or len(body) < 4:
+                        continue
+                    ch = tunnel_channel_id(body)  # body[2]
+                    with self.lock:
+                        sess = self.sessions.get(ch)
                     if sess and sess.alive:
                         sess.last_seen = time.monotonic()
                         sess.send_to_backend(make_frame(svc, body))
 
                 elif svc == CONNSTATE_REQ:
-                    if not body: continue
+                    if not body:
+                        continue
                     ch = body[0]
-                    with self.lock: sess = self.sessions.get(ch)
+                    with self.lock:
+                        sess = self.sessions.get(ch)
                     if sess and sess.alive:
                         sess.last_seen = time.monotonic()
                         sess.send_to_backend(make_frame(svc, body))
 
                 elif svc in (DISCONNECT_REQ, DISCONNECT_RESP):
                     ch = body[0] if body else 0
-                    with self.lock: sess = self.sessions.pop(ch, None)
+                    with self.lock:
+                        sess = self.sessions.pop(ch, None)
                     if sess:
                         sess.send_to_backend(make_frame(svc, body))
                         log.info(f"Session {ch} disconnected by TCP client")
@@ -539,14 +556,35 @@ class KNXProxy:
             log.debug(f"TCP client {addr}: {e}")
         finally:
             if ch_id is not None:
-                with self.lock: sess = self.sessions.pop(ch_id, None)
-                if sess: sess.close()
-            try: sock.close()
-            except Exception: pass
+                with self.lock:
+                    sess = self.sessions.pop(ch_id, None)
+                if sess:
+                    sess.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
             log.info(f"TCP client {addr[0]}:{addr[1]} disconnected")
 
     # ------------------------------------------------------------------
-    # Stale session cleanup
+    # TCP accept loop
+    # ------------------------------------------------------------------
+    def _tcp_accept_loop(self):
+        while self.running:
+            try:
+                sock, addr = self.tcp_srv.accept()
+                threading.Thread(target=self._handle_tcp_client,
+                                 args=(sock, addr), daemon=True,
+                                 name=f"tcp-{addr[0]}").start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    log.error(f"TCP accept: {e}")
+                    time.sleep(1)
+
+    # ------------------------------------------------------------------
+    # Cleanup loop
     # ------------------------------------------------------------------
     def _cleanup_loop(self):
         while self.running:
@@ -561,31 +599,12 @@ class KNXProxy:
                     s.close()
 
     # ------------------------------------------------------------------
-    # TCP accept loop
-    # ------------------------------------------------------------------
-    def _tcp_accept_loop(self):
-        while self.running:
-            try:
-                sock, addr = self.tcp_srv.accept()
-                threading.Thread(
-                    target=self._handle_tcp_client,
-                    args=(sock, addr), daemon=True,
-                    name=f"tcp-{addr[0]}"
-                ).start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    log.error(f"TCP accept: {e}")
-                    time.sleep(1)
-
-    # ------------------------------------------------------------------
     # Main
     # ------------------------------------------------------------------
     def run(self):
-        threading.Thread(target=self._cleanup_loop,   daemon=True, name="cleanup").start()
+        threading.Thread(target=self._cleanup_loop,    daemon=True, name="cleanup").start()
         threading.Thread(target=self._tcp_accept_loop, daemon=True, name="tcp-accept").start()
-        log.info(f"Ready — port {self.port} open for TCP and UDP")
+        log.info("Proxy running — waiting for connections")
 
         while self.running:
             try:
@@ -594,16 +613,15 @@ class KNXProxy:
                 continue
             except OSError as e:
                 if self.running:
-                    log.error(f"UDP recv: {e}")
+                    log.error(f"UDP recv error: {e}")
                     time.sleep(1)
                 continue
-            threading.Thread(
-                target=self._dispatch_udp,
-                args=(data, addr), daemon=True
-            ).start()
+            threading.Thread(target=self._dispatch_udp,
+                             args=(data, addr), daemon=True).start()
 
         with self.lock:
-            for s in self.sessions.values(): s.close()
+            for s in self.sessions.values():
+                s.close()
             self.sessions.clear()
         for s in (self.udp, self.tcp_srv):
             try: s.close()
@@ -613,4 +631,9 @@ class KNXProxy:
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 3672
-    KNXProxy(port).run()
+    try:
+        KNXProxy(port).run()
+    except OSError as e:
+        log.error(f"FATAL: Cannot bind port {port}: {e}")
+        log.error("Is another process already using this port? Check with: ss -tulpn | grep 3672")
+        sys.exit(1)
