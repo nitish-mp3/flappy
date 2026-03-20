@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.4"
+VERSION      = "2.6.5"
 BACKEND_FILE = "/run/knx-active-backend"
 MAGIC        = b'\x06\x10'
 
@@ -313,12 +313,19 @@ class KNXProxy:
                 # some prefer client CRI, some require classic tunneling CRI.
                 cri_client = cri if cri else b'\x04\x04\x02\x00'
                 cri_v1 = b'\x04\x04\x02\x00'
-                attempts = [
-                    (b_local_ip, cri_client, 'local-ip + client-cri'),
-                    ('0.0.0.0', cri_client, 'wildcard-ip + client-cri'),
-                    (b_local_ip, cri_v1, 'local-ip + cri-v1'),
-                    ('0.0.0.0', cri_v1, 'wildcard-ip + cri-v1'),
-                ]
+
+                # client_ctrl[0] is often the HAOS host IP visible on LAN.
+                # In containerized setups backend may not be able to route to b_local_ip
+                # (e.g. 172.x), so we also try the caller-visible host IP.
+                hpai_ips = []
+                for ip in (b_local_ip, client_ctrl[0], '0.0.0.0'):
+                    if ip not in hpai_ips:
+                        hpai_ips.append(ip)
+
+                attempts = []
+                for hpai_ip in hpai_ips:
+                    attempts.append((hpai_ip, cri_client, f'{hpai_ip} + client-cri'))
+                    attempts.append((hpai_ip, cri_v1, f'{hpai_ip} + cri-v1'))
 
                 last_status = None
                 for hpai_ip, cri_try, label in attempts:
