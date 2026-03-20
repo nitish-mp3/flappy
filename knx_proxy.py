@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.3"
+VERSION      = "2.6.4"
 BACKEND_FILE = "/run/knx-active-backend"
 MAGIC        = b'\x06\x10'
 
@@ -288,33 +288,65 @@ class KNXProxy:
         _, _, _, off = parse_hpai(connect_body, off)
         cri = connect_body[off:]
 
-        # Backend-facing CONNECT translation:
-        # - UDP backends generally expect classic tunneling v1 CRI.
-        # - TCP backends can use client CRI as-is.
-        if b_proto == 'udp':
-            backend_cri = b'\x04\x04\x02\x00'
-        else:
-            backend_cri = cri if cri else b'\x04\x04\x02\x00'
+        def do_connect_request(req_body: bytes):
+            req_frame = make_frame(CONNECT_REQ, req_body)
+            if b_proto == 'tcp':
+                bsock.sendall(req_frame)
+                return read_tcp_frame(bsock)
+            bsock.send(req_frame)
+            raw = bsock.recv(1024)
+            return parse_frame(raw)
 
-        # For UDP backend tunneling, advertise 0.0.0.0:<port> in HPAI to keep
-        # reply routing NAT/container-safe while preserving our bound source port.
-        if b_proto == 'udp':
-            hpai_ip = '0.0.0.0'
-        else:
-            hpai_ip = b_local_ip
+        def build_connect_body(hpai_ip: str, cri_value: bytes):
+            return make_hpai(hpai_ip, b_local_port, b_hpai_proto) + make_hpai(hpai_ip, b_local_port, b_hpai_proto) + cri_value
 
-        new_body  = (make_hpai(hpai_ip, b_local_port, b_hpai_proto) +
-                     make_hpai(hpai_ip, b_local_port, b_hpai_proto) + backend_cri)
-        req_frame = make_frame(CONNECT_REQ, new_body)
+        resp_svc = None
+        resp_body = None
 
         try:
             if b_proto == 'tcp':
-                bsock.sendall(req_frame)
-                resp_svc, resp_body = read_tcp_frame(bsock)
+                backend_cri = cri if cri else b'\x04\x04\x02\x00'
+                resp_svc, resp_body = do_connect_request(build_connect_body(b_local_ip, backend_cri))
             else:
-                bsock.send(req_frame)
-                raw = bsock.recv(1024)
-                resp_svc, resp_body = parse_frame(raw)
+                # UDP backend compatibility matrix:
+                # some interfaces require concrete HPAI IP, some require 0.0.0.0,
+                # some prefer client CRI, some require classic tunneling CRI.
+                cri_client = cri if cri else b'\x04\x04\x02\x00'
+                cri_v1 = b'\x04\x04\x02\x00'
+                attempts = [
+                    (b_local_ip, cri_client, 'local-ip + client-cri'),
+                    ('0.0.0.0', cri_client, 'wildcard-ip + client-cri'),
+                    (b_local_ip, cri_v1, 'local-ip + cri-v1'),
+                    ('0.0.0.0', cri_v1, 'wildcard-ip + cri-v1'),
+                ]
+
+                last_status = None
+                for hpai_ip, cri_try, label in attempts:
+                    try:
+                        resp_svc, resp_body = do_connect_request(build_connect_body(hpai_ip, cri_try))
+                    except socket.timeout:
+                        log.warning(f"Backend CONNECT attempt timed out ({label})")
+                        continue
+
+                    if resp_svc != CONNECT_RESP or not resp_body or len(resp_body) < 2:
+                        continue
+
+                    status_try = resp_body[1]
+                    if status_try == 0x00:
+                        log.info(f"Backend CONNECT accepted ({label})")
+                        break
+
+                    last_status = status_try
+                    log.warning(f"Backend CONNECT rejected ({label}) status=0x{status_try:02x}")
+
+                if (resp_svc != CONNECT_RESP) or (not resp_body) or (len(resp_body) < 2):
+                    if last_status is not None:
+                        self._send_connect_error(client_type, client_ctrl, client_sock, last_status)
+                    else:
+                        self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
+                    bsock.close()
+                    return
+
         except socket.timeout:
             log.error(f"Backend {b_host}:{b_port} CONNECT_REQUEST timed out")
             bsock.close()
@@ -514,6 +546,16 @@ class KNXProxy:
                     log.info("TCP DESCRIPTION_REQUEST → sending response")
                     try: sock.sendall(DESCRIPTION_RESPONSE)
                     except Exception as e: log.error(f"TCP DESCRIPTION_RESPONSE failed: {e}"); break
+
+                elif svc == SEARCH_REQ:
+                    log.info("TCP SEARCH_REQUEST → sending SEARCH_RESPONSE")
+                    try: sock.sendall(_build_search_resp(self.port, SEARCH_RESP))
+                    except Exception as e: log.error(f"TCP SEARCH_RESPONSE failed: {e}"); break
+
+                elif svc == SEARCH_REQ_EXT:
+                    log.info("TCP SEARCH_REQUEST_EXT → sending SEARCH_RESPONSE_EXT")
+                    try: sock.sendall(_build_search_resp(self.port, SEARCH_RESP_EXT))
+                    except Exception as e: log.error(f"TCP SEARCH_RESPONSE_EXT failed: {e}"); break
 
                 elif svc == CONNECT_REQ:
                     ctrl = (addr[0], addr[1])
