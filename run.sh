@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.20"
+readonly VERSION="2.6.21"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -120,6 +120,13 @@ load_config() {
     [[ "$BACKUP_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "backup_protocol must be one of: tcp, udp, auto"
     [[ "$PREFER_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "prefer_protocol must be one of: tcp, udp, auto"
     [[ "$LISTEN_PORT" != "$UDP_BRIDGE_PORT" ]] || die "listen_port and udp_bridge_port must differ"
+
+    # Deterministic safety behavior for legacy configs that still have auto/auto.
+    # This prevents repeatedly selecting a discovery-only UDP path on primary.
+    if [[ "$PRIMARY_PROTOCOL" == "auto" && "$BACKUP_PROTOCOL" == "auto" ]]; then
+        PRIMARY_PROTOCOL="tcp"
+        BACKUP_PROTOCOL="udp"
+    fi
 }
 
 select_backend_proto() {
