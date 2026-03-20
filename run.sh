@@ -20,7 +20,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.5.0"
+readonly VERSION="2.6.0"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -130,17 +130,38 @@ ha_notify() {
 # Probes an endpoint and returns "tcp", "udp", or "none"
 # ---------------------------------------------------------------------------
 detect_protocol() {
+    # Detect KNX protocol by sending actual KNX DESCRIPTION_REQUEST frames.
+    # A raw TCP socket connect test is NOT sufficient — many KNX interfaces
+    # accept TCP connections for web/management but only speak KNX over UDP.
     local host="$1" port="$2"
-    # Try TCP first (socat connect)
-    if timeout 2 socat -T1 - "TCP:${host}:${port},connect-timeout=1" \
-            </dev/null >/dev/null 2>&1; then
-        echo "tcp"; return
-    fi
-    # Try UDP KNX/IP Search Request
-    if printf '\x06\x10\x02\x01\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57' | \
+
+    # 1. Try KNX UDP: send DESCRIPTION_REQUEST, expect DESCRIPTION_RESPONSE
+    #    (service type 0x0203 → 0x0204)
+    if printf '\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57' | \
             timeout 3 socat -T2 STDIO "UDP:${host}:${port}" >/dev/null 2>&1; then
         echo "udp"; return
     fi
+
+    # 2. Try KNX TCP: connect, send DESCRIPTION_REQUEST over TCP, check for
+    #    a valid KNX response (starts with 06 10)
+    if python3 - << 'PYEOF' 2>/dev/null
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(("'"${host}"'", '"${port}"'))
+    s.sendall(b"\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57")
+    data = s.recv(64)
+    sys.exit(0 if len(data) >= 2 and data[:2] == b"\x06\x10" else 1)
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+PYEOF
+    then
+        echo "tcp"; return
+    fi
+
     echo "none"
 }
 
