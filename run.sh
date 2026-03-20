@@ -16,11 +16,12 @@ set -euo pipefail
 readonly OPTIONS_FILE="/data/options.json"
 readonly STATE_FILE="/run/knx-haproxy.state"
 readonly BACKEND_FILE="/run/knx-active-backend"
+readonly BACKEND_REJECT_FILE="/run/knx-backend-reject"
 readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.14"
+readonly VERSION="2.6.15"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -42,6 +43,8 @@ PROXY_PID=""
 PRIMARY_FAIL_COUNT=0
 PRIMARY_RISE_COUNT=0
 BACKUP_FAIL_COUNT=0
+PRIMARY_CONNECT_REJECT_COUNT=0
+BACKUP_CONNECT_REJECT_COUNT=0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -371,10 +374,38 @@ usb_probe() {
 set_backend() {
     local host="$1" port="$2" proto="$3"
     echo "${host}:${port}:${proto}" > "$BACKEND_FILE"
+    rm -f "$BACKEND_REJECT_FILE" 2>/dev/null || true
     log_debug "Backend → ${host}:${port} [${proto}]"
 }
 clear_backend() {
     echo "none" > "$BACKEND_FILE"
+    rm -f "$BACKEND_REJECT_FILE" 2>/dev/null || true
+}
+
+read_backend_reject_status() {
+    local host="$1" port="$2"
+    [[ -f "$BACKEND_REJECT_FILE" ]] || { echo ""; return 0; }
+
+    local r_host="" r_port="" r_status="" r_ts="" now age
+    r_host="$(grep -E '^host=' "$BACKEND_REJECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    r_port="$(grep -E '^port=' "$BACKEND_REJECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    r_status="$(grep -E '^status=' "$BACKEND_REJECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    r_ts="$(grep -E '^ts=' "$BACKEND_REJECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+
+    [[ "$r_host" == "$host" ]] || { echo ""; return 0; }
+    [[ "$r_port" == "$port" ]] || { echo ""; return 0; }
+    [[ -n "$r_status" && -n "$r_ts" ]] || { echo ""; return 0; }
+
+    now="$(date +%s)"
+    age=$(( now - r_ts ))
+    # Ignore stale reject reports from old sessions.
+    if [[ "$age" -gt 30 ]]; then
+        echo ""
+        return 0
+    fi
+
+    echo "$r_status"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -463,6 +494,7 @@ enter_primary() {
     log_notice "→ PRIMARY (${PRIMARY_HOST}:${PRIMARY_PORT} [${proto}])"
     CURRENT_STATE="$STATE_PRIMARY"
     PRIMARY_FAIL_COUNT=0; PRIMARY_RISE_COUNT=0; BACKUP_FAIL_COUNT=0
+    PRIMARY_CONNECT_REJECT_COUNT=0
     stop_bridge
     set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "$proto"
     reload_proxy
@@ -475,6 +507,7 @@ enter_backup() {
     local proto="$1"
     log_notice "→ BACKUP (${BACKUP_HOST}:${BACKUP_PORT} [${proto}])"
     CURRENT_STATE="$STATE_BACKUP"; BACKUP_FAIL_COUNT=0
+    BACKUP_CONNECT_REJECT_COUNT=0
     stop_bridge
     set_backend "$BACKUP_HOST" "$BACKUP_PORT" "$proto"
     reload_proxy
@@ -554,6 +587,23 @@ tick_primary() {
     local proto
     proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
+        local rej_status
+        rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
+        if [[ -n "$rej_status" ]]; then
+            PRIMARY_CONNECT_REJECT_COUNT=$((PRIMARY_CONNECT_REJECT_COUNT + 1))
+            log_warn "Primary tunnel rejected recently (${rej_status}) (${PRIMARY_CONNECT_REJECT_COUNT}/2)"
+            if [[ "$PRIMARY_CONNECT_REJECT_COUNT" -ge 2 ]]; then
+                log_warn "Primary reachable but not tunnel-usable — failing over"
+                local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+                if [[ "$bproto" != "none" ]]; then enter_backup "$bproto"
+                elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
+                else enter_degraded "primary-tunnel-reject-no-backup"; fi
+                return 0
+            fi
+        else
+            PRIMARY_CONNECT_REJECT_COUNT=0
+        fi
+
         log_debug "Primary: OK [${proto}]"; PRIMARY_FAIL_COUNT=0; return 0; fi
     PRIMARY_FAIL_COUNT=$((PRIMARY_FAIL_COUNT + 1))
     log_warn "Primary probe failed (${PRIMARY_FAIL_COUNT}/${CHECK_FALL})"
@@ -580,6 +630,20 @@ tick_backup() {
     fi
     local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$bproto" != "none" ]]; then
+        local rej_status
+        rej_status="$(read_backend_reject_status "$BACKUP_HOST" "$BACKUP_PORT")"
+        if [[ -n "$rej_status" ]]; then
+            BACKUP_CONNECT_REJECT_COUNT=$((BACKUP_CONNECT_REJECT_COUNT + 1))
+            log_warn "Backup tunnel rejected recently (${rej_status}) (${BACKUP_CONNECT_REJECT_COUNT}/2)"
+            if [[ "$BACKUP_CONNECT_REJECT_COUNT" -ge 2 ]]; then
+                if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
+                else enter_degraded "backup-tunnel-reject"; fi
+                return 0
+            fi
+        else
+            BACKUP_CONNECT_REJECT_COUNT=0
+        fi
+
         log_debug "Backup: OK [${bproto}]"; BACKUP_FAIL_COUNT=0
     else
         BACKUP_FAIL_COUNT=$((BACKUP_FAIL_COUNT + 1))
@@ -630,7 +694,7 @@ cleanup() {
     log_info "Shutting down..."
     stop_proxy  || true
     stop_bridge || true
-    rm -f "$STATE_FILE" "$BACKEND_FILE" 2>/dev/null || true
+    rm -f "$STATE_FILE" "$BACKEND_FILE" "$BACKEND_REJECT_FILE" 2>/dev/null || true
     log_info "Done"
 }
 trap cleanup INT TERM EXIT

@@ -7,8 +7,9 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.14"
+VERSION      = "2.6.15"
 BACKEND_FILE = "/run/knx-active-backend"
+BACKEND_REJECT_FILE = "/run/knx-backend-reject"
 MAGIC        = b'\x06\x10'
 
 SEARCH_REQ       = 0x0201
@@ -245,6 +246,25 @@ class KNXProxy:
         except Exception:
             pass
 
+    def _report_backend_reject(self, host: str, port: int, proto: str, status: int):
+        try:
+            with open(BACKEND_REJECT_FILE, 'w', encoding='ascii') as f:
+                f.write(f"host={host}\n")
+                f.write(f"port={port}\n")
+                f.write(f"proto={proto}\n")
+                f.write(f"status=0x{status:02x}\n")
+                f.write(f"ts={int(time.time())}\n")
+        except Exception:
+            pass
+
+    def _clear_backend_reject(self):
+        try:
+            os.remove(BACKEND_REJECT_FILE)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Backend connection
     # ------------------------------------------------------------------
@@ -278,6 +298,7 @@ class KNXProxy:
             bsock = self._open_backend(b_host, b_port, b_proto)
         except Exception as e:
             log.error(f"Cannot reach backend {b_host}:{b_port} [{b_proto}]: {e}")
+            self._report_backend_reject(b_host, b_port, b_proto, 0x26)
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
             return
 
@@ -481,8 +502,10 @@ class KNXProxy:
 
                 if (resp_svc != CONNECT_RESP) or (not resp_body) or (len(resp_body) < 2):
                     if last_status is not None:
+                        self._report_backend_reject(b_host, b_port, b_proto, last_status)
                         self._send_connect_error(client_type, client_ctrl, client_sock, last_status)
                     else:
+                        self._report_backend_reject(b_host, b_port, b_proto, 0x26)
                         self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
                     bsock.close()
                     return
@@ -490,11 +513,13 @@ class KNXProxy:
         except socket.timeout:
             log.error(f"Backend {b_host}:{b_port} CONNECT_REQUEST timed out")
             bsock.close()
+            self._report_backend_reject(b_host, b_port, b_proto, 0x26)
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
             return
         except Exception as e:
             log.error(f"Backend CONNECT error: {e}")
             bsock.close()
+            self._report_backend_reject(b_host, b_port, b_proto, 0x26)
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
             return
 
@@ -503,6 +528,7 @@ class KNXProxy:
             body_txt = resp_body.hex() if resp_body else "none"
             log.error(f"Bad CONNECT_RESP from backend: svc={svc_txt} body={body_txt}")
             bsock.close()
+            self._report_backend_reject(b_host, b_port, b_proto, 0x26)
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
             return
 
@@ -512,6 +538,7 @@ class KNXProxy:
         if status != 0x00:
             log.warning(f"Backend refused CONNECT: status=0x{status:02x}")
             bsock.close()
+            self._report_backend_reject(b_host, b_port, b_proto, status)
             # Return explicit error in client-facing format.
             self._send_connect_error(client_type, client_ctrl, client_sock, status)
             return
@@ -538,6 +565,8 @@ class KNXProxy:
 
         threading.Thread(target=self._relay_from_backend, args=(sess,),
                          daemon=True, name=f"relay-{ch_id}").start()
+
+        self._clear_backend_reject()
 
         if not self._send_raw(c_frame, client_type, client_ctrl, client_sock):
             with self.lock: self.sessions.pop(ch_id, None)
