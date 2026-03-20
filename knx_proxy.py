@@ -619,10 +619,9 @@ class KNXProxy:
             crd = resp_body[2:]
 
         c_proto = PROTO_TCP if client_type == 'tcp' else PROTO_UDP
-        # For TCP frontend tunneling, many clients expect a wildcard endpoint
-        # (port 0) in CONNECT_RESPONSE since data/control travel over the same
-        # established TCP stream.
-        c_port = 0 if client_type == 'tcp' else self.port
+        # TCP clients are more tolerant when the proxy advertises its actual
+        # listening port instead of a zero-port wildcard endpoint.
+        c_port = self.port if client_type == 'tcp' else 0
         c_resp = bytes([ch_id, 0x00]) + make_hpai('0.0.0.0', c_port, c_proto) + crd
         c_frame  = make_frame(CONNECT_RESP, c_resp)
 
@@ -667,7 +666,9 @@ class KNXProxy:
             return False
 
     def _send_connect_error(self, ctype, ctrl, csock, code):
-        body = bytes([0x00, code]) + make_hpai('0.0.0.0', 0) + b'\x04\x04\x00\x00'
+        proto = PROTO_TCP if ctype == 'tcp' else PROTO_UDP
+        port = self.port if ctype == 'tcp' else 0
+        body = bytes([0x00, code]) + make_hpai('0.0.0.0', port, proto) + b'\x04\x04\x00\x00'
         self._send_raw(make_frame(CONNECT_RESP, body), ctype, ctrl, csock)
 
     # ------------------------------------------------------------------
