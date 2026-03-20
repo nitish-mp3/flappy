@@ -1,5 +1,5 @@
 #!/usr/bin/with-contenv bashio
-set -euo pipefail
+set -eo pipefail
 
 # Load configuration from Home Assistant addon options
 PRIMARY_HOST="$(bashio::config 'primary_host')"
