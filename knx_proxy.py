@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.15"
+VERSION      = "2.6.16"
 BACKEND_FILE = "/run/knx-active-backend"
 BACKEND_REJECT_FILE = "/run/knx-backend-reject"
 MAGIC        = b'\x06\x10'

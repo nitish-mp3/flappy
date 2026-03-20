@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.15"
+readonly VERSION="2.6.16"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -387,14 +387,15 @@ read_backend_reject_status() {
     [[ -f "$BACKEND_REJECT_FILE" ]] || { echo ""; return 0; }
 
     local r_host="" r_port="" r_status="" r_ts="" now age
-    r_host="$(grep -E '^host=' "$BACKEND_REJECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
-    r_port="$(grep -E '^port=' "$BACKEND_REJECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
-    r_status="$(grep -E '^status=' "$BACKEND_REJECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
-    r_ts="$(grep -E '^ts=' "$BACKEND_REJECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+    r_host="$(awk -F= '$1=="host"{print $2; exit}' "$BACKEND_REJECT_FILE" 2>/dev/null || true)"
+    r_port="$(awk -F= '$1=="port"{print $2; exit}' "$BACKEND_REJECT_FILE" 2>/dev/null || true)"
+    r_status="$(awk -F= '$1=="status"{print $2; exit}' "$BACKEND_REJECT_FILE" 2>/dev/null || true)"
+    r_ts="$(awk -F= '$1=="ts"{print $2; exit}' "$BACKEND_REJECT_FILE" 2>/dev/null || true)"
 
     [[ "$r_host" == "$host" ]] || { echo ""; return 0; }
     [[ "$r_port" == "$port" ]] || { echo ""; return 0; }
     [[ -n "$r_status" && -n "$r_ts" ]] || { echo ""; return 0; }
+    is_int "$r_ts" || { echo ""; return 0; }
 
     now="$(date +%s)"
     age=$(( now - r_ts ))
@@ -584,10 +585,20 @@ monitor_tick() {
 }
 
 tick_primary() {
+    local rej_status
+    rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
+    if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
+        log_warn "Primary tunnel hard-reject detected (${rej_status}) — failing over now"
+        local bproto_now; bproto_now="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+        if [[ "$bproto_now" != "none" ]]; then enter_backup "$bproto_now"
+        elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
+        else enter_degraded "primary-hard-reject-no-backup"; fi
+        return 0
+    fi
+
     local proto
     proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
-        local rej_status
         rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
         if [[ -n "$rej_status" ]]; then
             PRIMARY_CONNECT_REJECT_COUNT=$((PRIMARY_CONNECT_REJECT_COUNT + 1))
@@ -617,6 +628,15 @@ tick_primary() {
 }
 
 tick_backup() {
+    local rej_status
+    rej_status="$(read_backend_reject_status "$BACKUP_HOST" "$BACKUP_PORT")"
+    if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
+        log_warn "Backup tunnel hard-reject detected (${rej_status})"
+        if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
+        else enter_degraded "backup-hard-reject"; fi
+        return 0
+    fi
+
     local proto
     proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
@@ -630,7 +650,6 @@ tick_backup() {
     fi
     local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$bproto" != "none" ]]; then
-        local rej_status
         rej_status="$(read_backend_reject_status "$BACKUP_HOST" "$BACKUP_PORT")"
         if [[ -n "$rej_status" ]]; then
             BACKUP_CONNECT_REJECT_COUNT=$((BACKUP_CONNECT_REJECT_COUNT + 1))
