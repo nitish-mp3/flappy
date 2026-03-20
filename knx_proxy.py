@@ -291,9 +291,10 @@ class KNXProxy:
             crd = CRD_DEFAULT
 
         # Build client-facing CONNECT_RESPONSE
+        # For TCP: HPAI must be 0.0.0.0:0 (= "use this TCP connection for data")
+        # For UDP: HPAI is 0.0.0.0:0 (= "use sender address")
         c_proto = PROTO_TCP if client_type == 'tcp' else PROTO_UDP
-        c_port = self.port if client_type == 'tcp' else 0
-        c_resp = bytes([ch_id, E_NO_ERROR]) + make_hpai('0.0.0.0', c_port, c_proto) + crd
+        c_resp = bytes([ch_id, E_NO_ERROR]) + make_hpai('0.0.0.0', 0, c_proto) + crd
         c_frame = make_frame(CONNECT_RESP, c_resp)
 
         # Create session
@@ -405,8 +406,7 @@ class KNXProxy:
                             code: int):
         """Send a CONNECT_RESPONSE with error status to the client."""
         proto = PROTO_TCP if ctype == 'tcp' else PROTO_UDP
-        port = self.port if ctype == 'tcp' else 0
-        body = bytes([0x00, code]) + make_hpai('0.0.0.0', port, proto) + CRD_DEFAULT
+        body = bytes([0x00, code]) + make_hpai('0.0.0.0', 0, proto) + CRD_DEFAULT
         frame = make_frame(CONNECT_RESP, body)
         try:
             if ctype == 'tcp' and csock:
@@ -627,11 +627,35 @@ class KNXProxy:
     # ──────────────────────────────────────────────────────────────────
 
     def _maintenance_loop(self):
-        """Periodic session cleanup and metrics writing."""
+        """Periodic session cleanup, backend heartbeat, and metrics writing."""
         while self.running:
             time.sleep(30)
             self.sessions.cleanup_stale()
+            self._send_backend_heartbeats()
             self.sessions.write_metrics()
+
+    def _send_backend_heartbeats(self):
+        """
+        Send CONNECTIONSTATE_REQUEST to the backend for every active session.
+        KNX gateways disconnect tunnels that don't receive heartbeats within
+        their timeout (typically 60-120s, some use 30s).
+        The proxy must proactively heartbeat — relying on the client to
+        forward theirs is unreliable (timing, protocol mismatch).
+        """
+        sessions = self.sessions.get_all()
+        for sess in sessions:
+            if not sess.alive or sess.draining:
+                continue
+            try:
+                b_proto = PROTO_TCP if sess.backend_type == 'tcp' else PROTO_UDP
+                hb_body = bytes([sess.channel_id, 0x00]) + make_hpai('0.0.0.0', 0, b_proto)
+                hb_frame = make_frame(CONNSTATE_REQ, hb_body)
+                if not sess.send_to_backend(hb_frame):
+                    log.warning(f"Backend heartbeat failed ch={sess.channel_id}")
+                else:
+                    log.debug(f"Backend heartbeat sent ch={sess.channel_id}")
+            except Exception as e:
+                log.debug(f"Backend heartbeat error ch={sess.channel_id}: {e}")
 
     # ──────────────────────────────────────────────────────────────────
     # Main

@@ -266,7 +266,7 @@ class BackendConnector:
 
                 log.debug(f"Backend CONNECT rejected ({label}) status=0x{status:02x}")
 
-        log.warning(f"All CONNECT attempts failed (last_status=0x{last_status:02x if last_status else 0:02x})")
+        log.warning(f"All CONNECT attempts failed (last_status=0x{(last_status if last_status is not None else 0):02x})")
         return None, None, last_status
 
     def try_tcp_fallback(self, host: str, port: int,

@@ -49,8 +49,8 @@ SECURE_SESSION_STATUS  = 0x0954
 SECURE_TIMER_NOTIFY    = 0x0955
 
 # ── HPAI Protocol Codes ──────────────────────────────────────────────
-PROTO_UDP = 0x01
-PROTO_TCP = 0x06
+PROTO_UDP = 0x01   # IPV4_UDP per EN 13321-2
+PROTO_TCP = 0x02   # IPV4_TCP per EN 13321-2
 
 # ── CONNECT Status Codes ─────────────────────────────────────────────
 E_NO_ERROR           = 0x00
