@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.10"
+VERSION      = "2.6.11"
 BACKEND_FILE = "/run/knx-active-backend"
 MAGIC        = b'\x06\x10'
 
@@ -312,7 +312,16 @@ class KNXProxy:
                 # some interfaces require concrete HPAI IP, some require 0.0.0.0,
                 # some prefer client CRI, some require classic tunneling CRI.
                 cri_client = cri if cri else b'\x04\x04\x02\x00'
-                cri_v1 = b'\x04\x04\x02\x00'
+                # Interface compatibility set:
+                # 02 00 = tunneling v1 classic
+                # 04 00 = tunneling v2 style on some stacks
+                # 02 01 = vendor-specific variant observed in some gateways
+                cri_variants_udp = [
+                    (cri_client, 'client-cri'),
+                    (b'\x04\x04\x02\x00', 'cri-v1-0200'),
+                    (b'\x04\x04\x04\x00', 'cri-v2-0400'),
+                    (b'\x04\x04\x02\x01', 'cri-0201'),
+                ]
 
                 # client_ctrl[0] is often the HAOS host IP visible on LAN.
                 # In containerized setups backend may not be able to route to b_local_ip
@@ -324,8 +333,8 @@ class KNXProxy:
 
                 attempts = []
                 for hpai_ip in hpai_ips:
-                    attempts.append((hpai_ip, b_local_port, PROTO_UDP, cri_client, f'{hpai_ip}:{b_local_port}/udp + client-cri'))
-                    attempts.append((hpai_ip, b_local_port, PROTO_UDP, cri_v1, f'{hpai_ip}:{b_local_port}/udp + cri-v1'))
+                    for cri_try, cri_label in cri_variants_udp:
+                        attempts.append((hpai_ip, b_local_port, PROTO_UDP, cri_try, f'{hpai_ip}:{b_local_port}/udp + {cri_label}'))
 
                 last_status = None
                 for hpai_ip, hpai_port, hpai_proto, cri_try, label in attempts:
@@ -369,7 +378,9 @@ class KNXProxy:
 
                         cri_variants = [
                             (cri if cri else b'\x04\x04\x02\x00', 'client-cri'),
-                            (b'\x04\x04\x02\x00', 'cri-v1'),
+                            (b'\x04\x04\x02\x00', 'cri-v1-0200'),
+                            (b'\x04\x04\x04\x00', 'cri-v2-0400'),
+                            (b'\x04\x04\x02\x01', 'cri-0201'),
                         ]
 
                         tcp_attempts = []

@@ -176,17 +176,6 @@ def probe_tcp() -> bool:
     finally:
         s.close()
 
-def probe_tcp_connectable() -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout_s)
-    try:
-        s.connect((host, port))
-        return True
-    except Exception:
-        return False
-    finally:
-        s.close()
-
 def probe_udp() -> bool:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout_s)
@@ -202,10 +191,9 @@ def probe_udp() -> bool:
 
 tcp_ok = probe_tcp()
 udp_ok = probe_udp()
-tcp_connectable = probe_tcp_connectable()
 
 if prefer == "tcp":
-    result = "tcp" if (tcp_ok or tcp_connectable) else ("udp" if udp_ok else "none")
+    result = "tcp" if tcp_ok else ("udp" if udp_ok else "none")
 elif prefer == "udp":
     result = "udp" if udp_ok else ("tcp" if tcp_ok else "none")
 else:
