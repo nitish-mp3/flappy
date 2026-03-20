@@ -265,6 +265,16 @@ reload_proxy() {
     return 0
 }
 
+    def probe_tcp_connectable() -> bool:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout_s)
+        try:
+            s.connect((host, port))
+            return True
+        except Exception:
+            return False
+        finally:
+            s.close()
 # ---------------------------------------------------------------------------
 # USB socat bridge  (UDP ↔ serial)
 # ---------------------------------------------------------------------------
@@ -281,9 +291,12 @@ start_usb_bridge() {
         SOCAT_PID=""; rm -f "$SOCAT_PID_FILE"; return 1
     fi
     log_info "USB bridge up (pid=${SOCAT_PID})"; return 0
+    tcp_connectable = probe_tcp_connectable()
 }
 
-stop_bridge() {
+        # Some interfaces do not implement DESCRIPTION over TCP consistently but
+        # still support tunneling over TCP. Prefer TCP when connectable.
+        result = "tcp" if (tcp_ok or tcp_connectable) else ("udp" if udp_ok else "none")
     local pid="${SOCAT_PID}"
     [[ -z "$pid" ]] && pid="$(cat "$SOCAT_PID_FILE" 2>/dev/null || true)"
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && {

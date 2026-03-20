@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.6"
+VERSION      = "2.6.7"
 BACKEND_FILE = "/run/knx-active-backend"
 MAGIC        = b'\x06\x10'
 
@@ -362,13 +362,24 @@ class KNXProxy:
                         b_local_ip, b_local_port = bsock.getsockname()[0], bsock.getsockname()[1]
                         b_hpai_proto = PROTO_TCP
 
-                        tcp_attempts = [
-                            (cri if cri else b'\x04\x04\x02\x00', 'tcp + client-cri'),
-                            (b'\x04\x04\x02\x00', 'tcp + cri-v1'),
+                        hpai_ips_tcp = []
+                        for ip in (b_local_ip, client_ctrl[0], '0.0.0.0'):
+                            if ip not in hpai_ips_tcp:
+                                hpai_ips_tcp.append(ip)
+
+                        cri_variants = [
+                            (cri if cri else b'\x04\x04\x02\x00', 'client-cri'),
+                            (b'\x04\x04\x02\x00', 'cri-v1'),
                         ]
-                        for cri_try, label in tcp_attempts:
+
+                        tcp_attempts = []
+                        for hpai_ip in hpai_ips_tcp:
+                            for cri_try, cri_label in cri_variants:
+                                tcp_attempts.append((hpai_ip, cri_try, f'{hpai_ip} + {cri_label}'))
+
+                        for hpai_ip, cri_try, label in tcp_attempts:
                             try:
-                                resp_svc, resp_body = do_connect_request(build_connect_body(b_local_ip, cri_try))
+                                resp_svc, resp_body = do_connect_request(build_connect_body(hpai_ip, cri_try))
                             except socket.timeout:
                                 log.warning(f"Backend CONNECT attempt timed out ({label})")
                                 continue
