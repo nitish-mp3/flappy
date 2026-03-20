@@ -1,0 +1,38 @@
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+.env.local
+venv/
+env/
+
+# Home Assistant specific
+.HA_VERSION
+homeassistant.log
+configuration.yaml
+secrets.yaml
+www/
+deps/
+tts/
+
+# Docker
+Dockerfile.build
+docker-compose.override.yml
+
+# Temporary files
+*.tmp
+*.log
+*.pid

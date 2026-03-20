@@ -1,0 +1,47 @@
+---
+name: KNX HAProxy
+slug: knx_haproxy
+description: KNX TCP failover proxy with automatic backend selection
+version: "1.2.0"
+image: ghcr.io/your-username/knx-haproxy-{arch}
+homeassistant: "2024.1.0"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: services
+boot: auto
+environment:
+  LOG_LEVEL: info
+ports:
+  3672/tcp: 3672
+options:
+  primary_host: 192.168.1.212
+  primary_port: 3671
+  backup_host: 192.168.1.104
+  backup_port: 3671
+  listen_port: 3672
+  log_level: info
+  connection_timeout: 5
+  client_timeout: 60
+  server_timeout: 60
+schema:
+  primary_host: str
+  primary_port: port
+  backup_host: str
+  backup_port: port
+  listen_port: port
+  log_level: list(debug|info|warning|error)?
+  connection_timeout: int(1,)?
+  client_timeout: int(1,)?
+  server_timeout: int(1,)?
+privileged: []
+uart: []
+udev: false
+access_token: false
+devices: []
+realtime: false
+init: true
+services: []

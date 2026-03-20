@@ -1,0 +1,7 @@
+name: KNX HAProxy Addon Repository
+url: https://github.com/your-username/knx-haproxy-addon
+maintainer: Your Name <your.email@example.com>
+codeowners:
+  - your-username
+documentation: https://github.com/your-username/knx-haproxy-addon/blob/main/README.md
+issues: https://github.com/your-username/knx-haproxy-addon/issues
