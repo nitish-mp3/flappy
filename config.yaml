@@ -2,7 +2,7 @@
 name: KNX HAProxy
 slug: knx_haproxy
 description: KNX TCP failover proxy with automatic backend selection
-version: "1.2.5"
+version: "1.2.6"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -17,9 +17,9 @@ environment:
 ports:
   3672/tcp: 3672
 options:
-  primary_host: 192.168.1.212
+  primary_host: ""
   primary_port: 3671
-  backup_host: 192.168.1.104
+  backup_host: ""
   backup_port: 3671
   listen_port: 3672
   log_level: info

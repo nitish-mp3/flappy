@@ -36,9 +36,9 @@ log_error() {
 }
 
 # Load configuration
-PRIMARY_HOST="$(get_config 'primary_host' '192.168.1.212')"
+PRIMARY_HOST="$(get_config 'primary_host' '')"
 PRIMARY_PORT="$(get_config 'primary_port' '3671')"
-BACKUP_HOST="$(get_config 'backup_host' '192.168.1.104')"
+BACKUP_HOST="$(get_config 'backup_host' '')"
 BACKUP_PORT="$(get_config 'backup_port' '3671')"
 LISTEN_PORT="$(get_config 'listen_port' '3672')"
 CONN_TIMEOUT="$(get_config 'connection_timeout' '5')"
@@ -47,7 +47,7 @@ SERVER_TIMEOUT="$(get_config 'server_timeout' '60')"
 
 # Validate
 if [ -z "$PRIMARY_HOST" ] || [ -z "$BACKUP_HOST" ]; then
-    log_error "Primary and backup hosts must be configured"
+    log_error "primary_host and backup_host are required and cannot be empty"
     exit 1
 fi
 
