@@ -2,9 +2,10 @@
 name: KNX Failover Proxy
 slug: knx_haproxy
 description: >
-  KNX/IP active-passive failover proxy. Supports TCP/IP, UDP/IP (auto-bridged),
-  and USB/serial interfaces with automatic failover and recovery.
-version: "2.2.2"
+  KNX/IP failover proxy using knxd. Speaks the full KNX/IP protocol
+  (UDP + TCP, automatic DESCRIPTION/SEARCH responses). Supports TCP/IP,
+  UDP/IP, and USB/serial interfaces with automatic failover and recovery.
+version: "2.3.0"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -15,12 +16,9 @@ arch:
 startup: services
 boot: auto
 
-# Both TCP and UDP must be published on the listen port.
-# TCP  — carries the actual KNX tunneling traffic via HAProxy
-# UDP  — answers xknx DESCRIPTION_REQUEST so HA can discover the proxy
 ports:
-  3672/tcp: 3672
-  3672/udp: 3672
+  3671/tcp: 3671
+  3671/udp: 3671
 
 options:
   primary_host: ""
@@ -30,15 +28,13 @@ options:
   usb_device: ""
   usb_baud: 19200
   usb_priority: last_resort
-  udp_bridge_port: 13671
-  listen_port: 3672
+  listen_port: 3671
   log_level: info
   connection_timeout: 5
-  client_timeout: 300
-  server_timeout: 300
   health_check_interval: 5
   health_check_fall: 3
   health_check_rise: 2
+  client_tunnels: 4
   notify_on_failover: false
 
 schema:
@@ -49,15 +45,13 @@ schema:
   usb_device: str?
   usb_baud: int(1200,)?
   usb_priority: list(last_resort|prefer)?
-  udp_bridge_port: port?
   listen_port: port
   log_level: list(debug|info|warning|error)?
   connection_timeout: int(1,)?
-  client_timeout: int(1,)?
-  server_timeout: int(1,)?
   health_check_interval: int(1,)?
   health_check_fall: int(1,)?
   health_check_rise: int(1,)?
+  client_tunnels: int(1,8)?
   notify_on_failover: bool?
 
 privileged: []
