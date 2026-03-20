@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Source bashio if available, otherwise provide fallback
+# Source bashio if available
 if [ -f /usr/lib/bashio.sh ]; then
     source /usr/lib/bashio.sh || true
 fi
@@ -23,7 +23,7 @@ log_info() {
     if type bashio::log.info &>/dev/null; then
         bashio::log.info "$1"
     else
-        echo "[INFO] $1"
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') $1"
     fi
 }
 
@@ -31,9 +31,12 @@ log_error() {
     if type bashio::log.error &>/dev/null; then
         bashio::log.error "$1"
     else
-        echo "[ERROR] $1" >&2
+        echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $1" >&2
     fi
 }
+
+# Trap signals for graceful shutdown
+trap 'log_info "Shutting down..."; kill %1; exit 0' SIGTERM SIGINT
 
 # Load configuration
 PRIMARY_HOST="$(get_config 'primary_host' '192.168.1.212')"
@@ -41,7 +44,6 @@ PRIMARY_PORT="$(get_config 'primary_port' '3671')"
 BACKUP_HOST="$(get_config 'backup_host' '192.168.1.104')"
 BACKUP_PORT="$(get_config 'backup_port' '3671')"
 LISTEN_PORT="$(get_config 'listen_port' '3672')"
-LOG_LEVEL="$(get_config 'log_level' 'info')"
 CONN_TIMEOUT="$(get_config 'connection_timeout' '5')"
 CLIENT_TIMEOUT="$(get_config 'client_timeout' '60')"
 SERVER_TIMEOUT="$(get_config 'server_timeout' '60')"
@@ -52,17 +54,16 @@ if [ -z "$PRIMARY_HOST" ] || [ -z "$BACKUP_HOST" ]; then
     exit 1
 fi
 
-log_info "Starting KNX HAProxy with:"
+log_info "Starting KNX HAProxy..."
 log_info "  Primary: ${PRIMARY_HOST}:${PRIMARY_PORT}"
 log_info "  Backup:  ${BACKUP_HOST}:${BACKUP_PORT}"
 log_info "  Listen:  0.0.0.0:${LISTEN_PORT}"
 
 # Generate HAProxy configuration
-cat >/etc/haproxy.cfg <<EOF
+cat >/etc/haproxy.cfg <<'EOF'
 global
     log stdout format raw local0
     maxconn 4096
-    daemon
 
 defaults
     log global
@@ -88,5 +89,12 @@ EOF
 
 log_info "HAProxy configuration generated successfully"
 
-# Start HAProxy
-exec haproxy -f /etc/haproxy.cfg -V
+# Substitute variables in config
+sed -i "s/\${CONN_TIMEOUT}/${CONN_TIMEOUT}/g" /etc/haproxy.cfg
+sed -i "s/\${CLIENT_TIMEOUT}/${CLIENT_TIMEOUT}/g" /etc/haproxy.cfg
+sed -i "s/\${SERVER_TIMEOUT}/${SERVER_TIMEOUT}/g" /etc/haproxy.cfg
+
+# Start HAProxy in foreground
+log_info "HAProxy starting..."
+exec haproxy -f /etc/haproxy.cfg -d &
+wait $!

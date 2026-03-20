@@ -1,0 +1,3 @@
+#!/command/execlineb -P
+define LOG_LEVEL info
+/run.sh

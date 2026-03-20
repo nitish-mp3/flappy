@@ -1,6 +1,6 @@
 name: KNX HAProxy Addon Repository
 url: https://github.com/nitish-mp3/flappy
-maintainer: Your Name <your.email@example.com>
+maintainer: Niti
 codeowners:
   - nitish-p3
 documentation: https://github.com/nitish-mp3/flappy
