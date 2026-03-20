@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.24"
+readonly VERSION="2.6.25"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -765,17 +765,12 @@ tick_backup() {
             PRIMARY_RISE_COUNT=0
         fi
     fi
-    local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-    if [[ "$bproto" != "none" ]]; then
-        bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
-        log_debug "Backup: probe OK [${bproto}]"
-        BACKUP_FAIL_COUNT=0
-    else
-        # Do not leave BACKUP solely due to probe failures.
-        # Real tunnel-level rejects are handled above via BACKEND_REJECT_FILE.
-        BACKUP_FAIL_COUNT=$((BACKUP_FAIL_COUNT + 1))
-        log_warn "Backup probe failed (${BACKUP_FAIL_COUNT}/${CHECK_FALL}) — keeping BACKUP until tunnel rejects"
-    fi
+    # Do not actively probe backup while we are already routing through it.
+    # Probe traffic itself can be noisy/expensive on some KNX gateways and
+    # may interfere with limited tunnel slot resources.
+    # We stay in BACKUP unless live tunnel rejects indicate it is unusable.
+    BACKUP_FAIL_COUNT=0
+    log_debug "Backup active — skipping background backup probes"
     return 0
 }
 
