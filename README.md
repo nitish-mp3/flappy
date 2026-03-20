@@ -1,4 +1,4 @@
-# KNX HAProxy Addon
+# KNX Failover Proxy Add-on
 
-A Home Assistant addon providing reliable TCP failover proxy for KNX protocol with automatic backend selection and health checking.
+Professional Home Assistant add-on for active-passive KNX/IP failover with automatic backend selection.
 
