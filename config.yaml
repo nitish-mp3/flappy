@@ -3,7 +3,6 @@ name: KNX HAProxy
 slug: knx_haproxy
 description: KNX TCP failover proxy with automatic backend selection
 version: "1.2.0"
-image: ghcr.io/your-username/knx-haproxy-{arch}
 homeassistant: "2024.1.0"
 arch:
   - aarch64
