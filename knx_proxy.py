@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.26"
+VERSION      = "2.6.27"
 BACKEND_FILE = "/run/knx-active-backend"
 BACKEND_REJECT_FILE = "/run/knx-backend-reject"
 MAGIC        = b'\x06\x10'
@@ -29,6 +29,13 @@ TUNNELLING_ACK   = 0x0421
 
 PROTO_UDP = 0x01
 PROTO_TCP = 0x06
+
+FRONTEND_MODE = os.environ.get('FRONTEND_PROTOCOL', 'both').strip().lower()
+if FRONTEND_MODE not in ('udp', 'tcp', 'both'):
+    raise SystemExit(f"Invalid FRONTEND_PROTOCOL={FRONTEND_MODE!r}; expected udp, tcp, or both")
+
+ENABLE_UDP = FRONTEND_MODE in ('udp', 'both')
+ENABLE_TCP = FRONTEND_MODE in ('tcp', 'both')
 
 _lvl = os.environ.get('LOG_LEVEL', 'info').upper()
 logging.basicConfig(
@@ -127,16 +134,21 @@ def _build_dib_payload() -> bytes:
              b'\xaa\xbb\xcc\x00\x01\x02'
              b'\xe0\x00\x17\x0c'
              b'\x00\x00\x00\x00\x00\x00') + name
-    dib2 = b'\x0a\x02\x02\x02\x03\x02\x04\x02\x04\x01'
+    if FRONTEND_MODE == 'udp':
+        dib2 = b'\x08\x02\x02\x02\x03\x02\x04\x01'
+    elif FRONTEND_MODE == 'tcp':
+        dib2 = b'\x08\x02\x02\x02\x03\x02\x04\x02'
+    else:
+        dib2 = b'\x0a\x02\x02\x02\x03\x02\x04\x02\x04\x01'
     return dib1 + dib2
 
 def _build_desc_resp() -> bytes:
     return make_frame(DESCRIPTION_RESP, DIB_PAYLOAD)
 
-def _build_search_resp(port: int, svc: int) -> bytes:
+def _build_search_resp(port: int, svc: int, proto: int) -> bytes:
     # KNX SEARCH response requires an HPAI endpoint + DIB payload.
     # Use 0.0.0.0 with port to remain NAT/container friendly.
-    body = make_hpai('0.0.0.0', port, PROTO_UDP) + DIB_PAYLOAD
+    body = make_hpai('0.0.0.0', port, proto) + DIB_PAYLOAD
     return make_frame(svc, body)
 
 DIB_PAYLOAD = _build_dib_payload()
@@ -196,33 +208,38 @@ class KNXProxy:
         self.lock     = threading.Lock()
         self.running  = True
 
-        # UDP — SO_REUSEPORT so a clean restart can rebind immediately
-        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except (AttributeError, OSError):
-            pass
-        self.udp.bind(('0.0.0.0', port))
-        self.udp.settimeout(2.0)
-        log.info(f"UDP bound to 0.0.0.0:{port}")
+        self.udp = None
+        self.tcp_srv = None
 
-        # TCP
-        self.tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except (AttributeError, OSError):
-            pass
-        self.tcp_srv.bind(('0.0.0.0', port))
-        self.tcp_srv.listen(8)
-        self.tcp_srv.settimeout(2.0)
-        log.info(f"TCP bound to 0.0.0.0:{port}")
+        if ENABLE_UDP:
+            # UDP — SO_REUSEPORT so a clean restart can rebind immediately
+            self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass
+            self.udp.bind(('0.0.0.0', port))
+            self.udp.settimeout(2.0)
+            log.info(f"UDP bound to 0.0.0.0:{port}")
+
+        if ENABLE_TCP:
+            # TCP
+            self.tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass
+            self.tcp_srv.bind(('0.0.0.0', port))
+            self.tcp_srv.listen(8)
+            self.tcp_srv.settimeout(2.0)
+            log.info(f"TCP bound to 0.0.0.0:{port}")
 
         signal.signal(signal.SIGHUP,  lambda *_: threading.Thread(target=self._do_sighup, daemon=True).start())
         signal.signal(signal.SIGTERM, lambda *_: self._on_stop())
         signal.signal(signal.SIGINT,  lambda *_: self._on_stop())
-        log.info(f"KNX/IP proxy v{VERSION} ready on port {port} — TCP+UDP")
+        log.info(f"KNX/IP proxy v{VERSION} ready on port {port} — frontend={FRONTEND_MODE}")
 
     def _do_sighup(self):
         log.info("Backend changed — dropping all sessions")
@@ -642,7 +659,8 @@ class KNXProxy:
             if ctype == 'tcp' and csock:
                 csock.sendall(frame)
             elif ctrl:
-                self.udp.sendto(frame, ctrl)
+                if self.udp:
+                    self.udp.sendto(frame, ctrl)
             return True
         except Exception as e:
             log.debug(f"_send_raw: {e}")
@@ -717,12 +735,12 @@ class KNXProxy:
 
         elif svc == SEARCH_REQ:
             log.info("SEARCH_REQUEST → sending SEARCH_RESPONSE")
-            try: self.udp.sendto(_build_search_resp(self.port, SEARCH_RESP), addr)
+            try: self.udp.sendto(_build_search_resp(self.port, SEARCH_RESP, PROTO_UDP), addr)
             except Exception as e: log.error(f"SEARCH_RESPONSE failed: {e}")
 
         elif svc == SEARCH_REQ_EXT:
             log.info("SEARCH_REQUEST_EXT → sending SEARCH_RESPONSE_EXT")
-            try: self.udp.sendto(_build_search_resp(self.port, SEARCH_RESP_EXT), addr)
+            try: self.udp.sendto(_build_search_resp(self.port, SEARCH_RESP_EXT, PROTO_UDP), addr)
             except Exception as e: log.error(f"SEARCH_RESPONSE_EXT failed: {e}")
 
         elif svc == CONNECT_REQ:
@@ -781,12 +799,12 @@ class KNXProxy:
 
                 elif svc == SEARCH_REQ:
                     log.info("TCP SEARCH_REQUEST → sending SEARCH_RESPONSE")
-                    try: sock.sendall(_build_search_resp(self.port, SEARCH_RESP))
+                    try: sock.sendall(_build_search_resp(self.port, SEARCH_RESP, PROTO_TCP))
                     except Exception as e: log.error(f"TCP SEARCH_RESPONSE failed: {e}"); break
 
                 elif svc == SEARCH_REQ_EXT:
                     log.info("TCP SEARCH_REQUEST_EXT → sending SEARCH_RESPONSE_EXT")
-                    try: sock.sendall(_build_search_resp(self.port, SEARCH_RESP_EXT))
+                    try: sock.sendall(_build_search_resp(self.port, SEARCH_RESP_EXT, PROTO_TCP))
                     except Exception as e: log.error(f"TCP SEARCH_RESPONSE_EXT failed: {e}"); break
 
                 elif svc == CONNECT_REQ:
@@ -868,17 +886,22 @@ class KNXProxy:
     # ------------------------------------------------------------------
     def run(self):
         threading.Thread(target=self._cleanup_loop,    daemon=True, name="cleanup").start()
-        threading.Thread(target=self._tcp_accept_loop, daemon=True, name="tcp-accept").start()
+        if self.tcp_srv:
+            threading.Thread(target=self._tcp_accept_loop, daemon=True, name="tcp-accept").start()
         log.info("Waiting for KNX connections...")
 
         while self.running:
-            try:
-                data, addr = self.udp.recvfrom(2048)
-            except socket.timeout: continue
-            except OSError as e:
-                if self.running: log.error(f"UDP recv: {e}"); time.sleep(1)
-                continue
-            threading.Thread(target=self._dispatch_udp, args=(data, addr), daemon=True).start()
+            if self.udp:
+                try:
+                    data, addr = self.udp.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    if self.running: log.error(f"UDP recv: {e}"); time.sleep(1)
+                    continue
+                threading.Thread(target=self._dispatch_udp, args=(data, addr), daemon=True).start()
+            else:
+                time.sleep(0.25)
 
         with self.lock:
             for s in self.sessions.values():
@@ -886,8 +909,9 @@ class KNXProxy:
                 s.close()
             self.sessions.clear()
         for s in (self.udp, self.tcp_srv):
-            try: s.close()
-            except Exception: pass
+            if s:
+                try: s.close()
+                except Exception: pass
         log.info("Proxy stopped")
 
 

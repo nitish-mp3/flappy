@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.26"
+readonly VERSION="2.6.27"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -31,6 +31,7 @@ readonly STATE_DEGRADED="DEGRADED"
 PRIMARY_HOST="" PRIMARY_PORT=""
 BACKUP_HOST=""  BACKUP_PORT=""
 PRIMARY_PROTOCOL="" BACKUP_PROTOCOL=""
+FRONTEND_PROTOCOL=""
 LISTEN_PORT=""  UDP_BRIDGE_PORT=""
 USB_DEVICE=""   USB_BAUD=""
 CHECK_INTERVAL="" CHECK_FALL="" CHECK_RISE=""
@@ -93,6 +94,7 @@ load_config() {
     BACKUP_HOST="$(read_option backup_host '')"
     BACKUP_PORT="$(read_option backup_port 3671)"
     BACKUP_PROTOCOL="$(read_option backup_protocol auto)"
+    FRONTEND_PROTOCOL="$(read_option frontend_protocol udp)"
     LISTEN_PORT="$(read_option listen_port 3672)"
     UDP_BRIDGE_PORT="$(read_option udp_bridge_port 13671)"
     CHECK_INTERVAL="$(read_option health_check_interval 5)"
@@ -122,6 +124,7 @@ load_config() {
     validate_pos_int "$USB_BAUD"        usb_baud
     [[ "$PRIMARY_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "primary_protocol must be one of: tcp, udp, auto"
     [[ "$BACKUP_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "backup_protocol must be one of: tcp, udp, auto"
+    [[ "$FRONTEND_PROTOCOL" =~ ^(udp|tcp|both)$ ]] || die "frontend_protocol must be one of: udp, tcp, both"
     [[ "$PREFER_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "prefer_protocol must be one of: tcp, udp, auto"
     [[ "$LISTEN_PORT" != "$UDP_BRIDGE_PORT" ]] || die "listen_port and udp_bridge_port must differ"
 
@@ -483,7 +486,7 @@ start_proxy() {
     pkill -f "knx_proxy.py" 2>/dev/null || true
     sleep 1
     log_info "Starting KNX/IP proxy on port ${LISTEN_PORT} (TCP + UDP)"
-    LOG_LEVEL="$LOG_LEVEL" python3 /knx_proxy.py "$LISTEN_PORT" &
+    FRONTEND_PROTOCOL="$FRONTEND_PROTOCOL" LOG_LEVEL="$LOG_LEVEL" python3 /knx_proxy.py "$LISTEN_PORT" &
     PROXY_PID="$!"
     echo "$PROXY_PID" > "$PROXY_PID_FILE"
     sleep 1
@@ -843,7 +846,8 @@ main() {
     log_info "Primary:  ${PRIMARY_HOST}:${PRIMARY_PORT}"
     log_info "Backup:   ${BACKUP_HOST}:${BACKUP_PORT}"
     log_info "Backend protocol pin: primary=${PRIMARY_PROTOCOL} backup=${BACKUP_PROTOCOL}"
-    log_info "Listen:   0.0.0.0:${LISTEN_PORT} (TCP + UDP)"
+    log_info "Frontend: ${FRONTEND_PROTOCOL}"
+    log_info "Listen:   0.0.0.0:${LISTEN_PORT} (frontend=${FRONTEND_PROTOCOL})"
     [[ -n "$USB_DEVICE" ]] && \
         log_info "USB:      ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY})"
     log_info "Health:   interval=${CHECK_INTERVAL}s fall=${CHECK_FALL} rise=${CHECK_RISE}"
