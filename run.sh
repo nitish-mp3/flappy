@@ -13,14 +13,14 @@ SERVER_TIMEOUT="$(bashio::config 'server_timeout')"
 
 # Validate required configuration
 if ! bashio::config.has_value 'primary_host' || ! bashio::config.has_value 'backup_host'; then
-    bashio::log.error "primary_host and backup_host are required and cannot be empty"
+    echo "[ERROR] primary_host and backup_host are required and cannot be empty" >&2
     exit 1
 fi
 
-bashio::log.info "Starting KNX HAProxy"
-bashio::log.info "  Primary: ${PRIMARY_HOST}:${PRIMARY_PORT}"
-bashio::log.info "  Backup:  ${BACKUP_HOST}:${BACKUP_PORT}"
-bashio::log.info "  Listen:  0.0.0.0:${LISTEN_PORT}"
+echo "[INFO] Starting KNX HAProxy"
+echo "[INFO] Primary: ${PRIMARY_HOST}:${PRIMARY_PORT}"
+echo "[INFO] Backup:  ${BACKUP_HOST}:${BACKUP_PORT}"
+echo "[INFO] Listen:  0.0.0.0:${LISTEN_PORT}"
 
 # Generate config with variables substituted inline
 cat > /etc/haproxy.cfg <<EOF
@@ -48,7 +48,7 @@ backend knx_backend
     server backup ${BACKUP_HOST}:${BACKUP_PORT} check backup
 EOF
 
-bashio::log.info "HAProxy ready"
+echo "[INFO] HAProxy ready"
 
 # Run in foreground - s6 will manage the process
 exec haproxy -f /etc/haproxy.cfg
