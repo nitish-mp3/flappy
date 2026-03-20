@@ -5,8 +5,7 @@ FROM $BUILD_FROM
 RUN apk add --no-cache \
     haproxy \
     curl \
-    ca-certificates \
-    tini
+    ca-certificates
 
 # Copy scripts and set permissions
 COPY run.sh /
@@ -17,6 +16,5 @@ RUN chmod a+x /run.sh /healthcheck.sh
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD /healthcheck.sh
 
-# Use tini for proper signal handling
-ENTRYPOINT ["/sbin/tini", "--"]
+# Run the startup script
 CMD ["/run.sh"]
