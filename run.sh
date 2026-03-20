@@ -20,7 +20,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.12"
+readonly VERSION="2.6.13"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -135,8 +135,10 @@ ha_notify() {
 # Probes an endpoint and returns "tcp", "udp", or "none"
 # ---------------------------------------------------------------------------
 detect_protocol() {
-    # Detect KNX protocol by requiring a valid KNX DESCRIPTION_RESPONSE.
-    # This avoids false positives from plain socket-open checks.
+    # Detect KNX protocol by requiring both:
+    # 1) valid KNX DESCRIPTION_RESPONSE
+    # 2) successful KNX CONNECT/RESP tunnel negotiation
+    # This avoids selecting endpoints that answer discovery but reject tunneling.
     local host="$1" port="$2"
     python3 - "$host" "$port" "$PREFER_PROTOCOL" "$CONNECTION_TIMEOUT" << 'PYEOF'
 import socket
@@ -149,6 +151,48 @@ prefer = sys.argv[3]
 timeout_s = max(1, int(sys.argv[4]))
 
 REQ = b"\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57"
+MAGIC = b"\x06\x10"
+
+PROTO_UDP = 0x01
+PROTO_TCP = 0x06
+
+CONNECT_RESP = 0x0206
+
+def make_frame(svc: int, body: bytes) -> bytes:
+    return MAGIC + struct.pack(">HH", svc, 6 + len(body)) + body
+
+def make_hpai(ip: str, port: int, proto: int) -> bytes:
+    return bytes([8, proto]) + socket.inet_aton(ip) + struct.pack(">H", port)
+
+def build_connect_req(proto: int) -> bytes:
+    # TUNNELING connection request (CRI 04 04 02 00)
+    hpai = make_hpai("0.0.0.0", 0, proto)
+    cri = b"\x04\x04\x02\x00"
+    return make_frame(0x0205, hpai + hpai + cri)
+
+def parse_frame(data: bytes):
+    if len(data) < 6 or data[:2] != MAGIC:
+        return None, None
+    svc = struct.unpack(">H", data[2:4])[0]
+    total = struct.unpack(">H", data[4:6])[0]
+    if total < 6 or total > len(data):
+        return None, None
+    return svc, data[6:total]
+
+def parse_connect_status(raw: bytes):
+    svc, body = parse_frame(raw)
+    if svc != CONNECT_RESP or body is None or len(body) < 2:
+        return None, None
+    return body[1], body
+
+def send_disconnect_udp(sock: socket.socket, host: str, port: int, channel_id: int):
+    # Best-effort release of probe tunnel slot.
+    body = bytes([channel_id, 0x00]) + make_hpai("0.0.0.0", 0, PROTO_UDP)
+    sock.sendto(make_frame(0x0209, body), (host, port))
+
+def send_disconnect_tcp(sock: socket.socket, channel_id: int):
+    body = bytes([channel_id, 0x00]) + make_hpai("0.0.0.0", 0, PROTO_TCP)
+    sock.sendall(make_frame(0x0209, body))
 
 def valid_desc_response(data: bytes) -> bool:
     if len(data) < 6:
@@ -176,6 +220,43 @@ def probe_tcp() -> bool:
     finally:
         s.close()
 
+def probe_tcp_tunnel() -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout_s)
+    try:
+        s.connect((host, port))
+
+        # Try TCP HPAI first, then UDP HPAI for compatibility.
+        for hpai_proto in (PROTO_TCP, PROTO_UDP):
+            s.sendall(build_connect_req(hpai_proto))
+            hdr = s.recv(6)
+            if len(hdr) < 6 or hdr[:2] != MAGIC:
+                return False
+            total = struct.unpack(">H", hdr[4:6])[0]
+            if total < 6:
+                return False
+            body = b""
+            while len(body) < (total - 6):
+                chunk = s.recv((total - 6) - len(body))
+                if not chunk:
+                    return False
+                body += chunk
+
+            status, cbody = parse_connect_status(hdr + body)
+            if status is None:
+                continue
+            if status == 0x00 and cbody is not None and len(cbody) >= 1:
+                try:
+                    send_disconnect_tcp(s, cbody[0])
+                except Exception:
+                    pass
+                return True
+        return False
+    except Exception:
+        return False
+    finally:
+        s.close()
+
 def probe_udp() -> bool:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout_s)
@@ -189,8 +270,34 @@ def probe_udp() -> bool:
     finally:
         s.close()
 
-tcp_ok = probe_tcp()
-udp_ok = probe_udp()
+def probe_udp_tunnel() -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout_s)
+    try:
+        s.bind(("0.0.0.0", 0))
+        for hpai_proto in (PROTO_UDP, PROTO_TCP):
+            s.sendto(build_connect_req(hpai_proto), (host, port))
+            raw, _ = s.recvfrom(1024)
+            status, body = parse_connect_status(raw)
+            if status is None:
+                continue
+            if status == 0x00 and body is not None and len(body) >= 1:
+                try:
+                    send_disconnect_udp(s, host, port, body[0])
+                except Exception:
+                    pass
+                return True
+        return False
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+tcp_desc_ok = probe_tcp()
+udp_desc_ok = probe_udp()
+
+tcp_ok = tcp_desc_ok and probe_tcp_tunnel()
+udp_ok = udp_desc_ok and probe_udp_tunnel()
 
 if prefer == "tcp":
     result = "tcp" if tcp_ok else ("udp" if udp_ok else "none")
