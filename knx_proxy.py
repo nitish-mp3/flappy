@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.17"
+VERSION      = "2.6.19"
 BACKEND_FILE = "/run/knx-active-backend"
 BACKEND_REJECT_FILE = "/run/knx-backend-reject"
 MAGIC        = b'\x06\x10'
@@ -338,14 +338,51 @@ class KNXProxy:
 
         try:
             if b_proto == 'tcp':
-                backend_cri = cri if cri else b'\x04\x04\x02\x00'
-                resp_svc, resp_body = do_connect_request(
-                    build_connect_body(
-                        '0.0.0.0', 0, PROTO_TCP,
-                        '0.0.0.0', 0, PROTO_TCP,
-                        backend_cri,
-                    )
-                )
+                cri_variants_tcp = [
+                    (cri if cri else b'\x04\x04\x02\x00', 'client-cri'),
+                    (b'\x04\x04\x02\x00', 'cri-v1-0200'),
+                    (b'\x04\x04\x04\x00', 'cri-v2-0400'),
+                ]
+                hpai_variants_tcp = [
+                    ('0.0.0.0', 0, PROTO_TCP, '0.0.0.0', 0, PROTO_TCP, 'tcp-both-zero/tcp'),
+                    ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', 0, PROTO_UDP, 'tcp-both-zero/udp'),
+                    ('0.0.0.0', 0, PROTO_TCP, b_local_ip, b_local_port, PROTO_TCP, f'tcp-ctrl-zero+data-local({b_local_ip}:{b_local_port})/tcp'),
+                ]
+
+                last_status = None
+                for ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto, hpai_label in hpai_variants_tcp:
+                    for cri_try, cri_label in cri_variants_tcp:
+                        label = f'{hpai_label} + {cri_label}'
+                        try:
+                            resp_svc, resp_body = do_connect_request(
+                                build_connect_body(
+                                    ctrl_ip,
+                                    ctrl_port,
+                                    ctrl_proto,
+                                    data_ip,
+                                    data_port,
+                                    data_proto,
+                                    cri_try,
+                                )
+                            )
+                        except socket.timeout:
+                            log.warning(f"Backend CONNECT attempt timed out ({label})")
+                            continue
+
+                        if resp_svc != CONNECT_RESP or not resp_body or len(resp_body) < 2:
+                            continue
+
+                        status_try = resp_body[1]
+                        if status_try == 0x00:
+                            log.info(f"Backend CONNECT accepted ({label})")
+                            last_status = 0x00
+                            break
+
+                        last_status = status_try
+                        log.warning(f"Backend CONNECT rejected ({label}) status=0x{status_try:02x}")
+
+                    if last_status == 0x00:
+                        break
             else:
                 # UDP backend compatibility matrix:
                 # Prefer standards-compliant endpoint combinations first.

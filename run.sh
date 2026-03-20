@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.17"
+readonly VERSION="2.6.19"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -45,6 +45,7 @@ PRIMARY_RISE_COUNT=0
 BACKUP_FAIL_COUNT=0
 PRIMARY_CONNECT_REJECT_COUNT=0
 BACKUP_CONNECT_REJECT_COUNT=0
+PRIMARY_TCP_RETRY_DONE=0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -382,6 +383,20 @@ clear_backend() {
     rm -f "$BACKEND_REJECT_FILE" 2>/dev/null || true
 }
 
+current_backend_proto() {
+    [[ -f "$BACKEND_FILE" ]] || { echo ""; return 0; }
+    local line host port proto
+    line="$(cat "$BACKEND_FILE" 2>/dev/null || true)"
+    [[ -n "$line" && "$line" != "none" ]] || { echo ""; return 0; }
+    host="${line%%:*}"
+    line="${line#*:}"
+    port="${line%%:*}"
+    proto="${line#*:}"
+    [[ -n "$host" && -n "$port" && -n "$proto" ]] || { echo ""; return 0; }
+    echo "$proto"
+    return 0
+}
+
 read_backend_reject_status() {
     local host="$1" port="$2"
     [[ -f "$BACKEND_REJECT_FILE" ]] || { echo ""; return 0; }
@@ -496,6 +511,7 @@ enter_primary() {
     CURRENT_STATE="$STATE_PRIMARY"
     PRIMARY_FAIL_COUNT=0; PRIMARY_RISE_COUNT=0; BACKUP_FAIL_COUNT=0
     PRIMARY_CONNECT_REJECT_COUNT=0
+    PRIMARY_TCP_RETRY_DONE=0
     stop_bridge
     set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "$proto"
     reload_proxy
@@ -605,6 +621,18 @@ tick_primary() {
     local rej_status
     rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
+        local active_proto
+        active_proto="$(current_backend_proto)"
+        if [[ "$active_proto" == "udp" && "$PRIMARY_TCP_RETRY_DONE" -eq 0 ]]; then
+            log_warn "Primary tunnel hard-reject detected (${rej_status}) on UDP — retrying same primary over TCP"
+            PRIMARY_TCP_RETRY_DONE=1
+            PRIMARY_CONNECT_REJECT_COUNT=0
+            set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "tcp"
+            reload_proxy
+            write_state
+            return 0
+        fi
+
         log_warn "Primary tunnel hard-reject detected (${rej_status}) — failing over now"
         enter_backup_fast
         return 0
@@ -618,6 +646,18 @@ tick_primary() {
             PRIMARY_CONNECT_REJECT_COUNT=$((PRIMARY_CONNECT_REJECT_COUNT + 1))
             log_warn "Primary tunnel rejected recently (${rej_status}) (${PRIMARY_CONNECT_REJECT_COUNT}/2)"
             if [[ "$PRIMARY_CONNECT_REJECT_COUNT" -ge 2 ]]; then
+                local active_proto
+                active_proto="$(current_backend_proto)"
+                if [[ "$active_proto" == "udp" && "$PRIMARY_TCP_RETRY_DONE" -eq 0 ]]; then
+                    log_warn "Primary reachable but not tunnel-usable on UDP — retrying same primary over TCP"
+                    PRIMARY_TCP_RETRY_DONE=1
+                    PRIMARY_CONNECT_REJECT_COUNT=0
+                    set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "tcp"
+                    reload_proxy
+                    write_state
+                    return 0
+                fi
+
                 log_warn "Primary reachable but not tunnel-usable — failing over"
                 enter_backup_fast
                 return 0
