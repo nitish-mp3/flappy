@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.23"
+VERSION      = "2.6.24"
 BACKEND_FILE = "/run/knx-active-backend"
 BACKEND_REJECT_FILE = "/run/knx-backend-reject"
 MAGIC        = b'\x06\x10'
@@ -230,6 +230,7 @@ class KNXProxy:
             sessions, self.sessions = list(self.sessions.values()), {}
         for sess in sessions:
             self._notify_client_disconnect(sess)
+            self._notify_backend_disconnect(sess)
             sess.close()
 
     def _on_stop(self):
@@ -243,6 +244,18 @@ class KNXProxy:
                 sess.client_sock.sendall(frame)
             elif sess.client_ctrl:
                 self.udp.sendto(frame, sess.client_ctrl)
+        except Exception:
+            pass
+
+    def _notify_backend_disconnect(self, sess):
+        try:
+            proto = PROTO_TCP if sess.backend_type == 'tcp' else PROTO_UDP
+            body  = bytes([sess.channel_id, 0x00]) + make_hpai('0.0.0.0', 0, proto)
+            frame = make_frame(DISCONNECT_REQ, body)
+            if sess.backend_type == 'tcp':
+                sess.backend_sock.sendall(frame)
+            else:
+                sess.backend_sock.send(frame)
         except Exception:
             pass
 
@@ -597,7 +610,9 @@ class KNXProxy:
 
         with self.lock:
             old = self.sessions.pop(ch_id, None)
-            if old: old.close()
+            if old:
+                self._notify_backend_disconnect(old)
+                old.close()
             self.sessions[ch_id] = sess
 
         threading.Thread(target=self._relay_from_backend, args=(sess,),
@@ -607,6 +622,7 @@ class KNXProxy:
 
         if not self._send_raw(c_frame, client_type, client_ctrl, client_sock):
             with self.lock: self.sessions.pop(ch_id, None)
+            self._notify_backend_disconnect(sess)
             sess.close()
             return
 
@@ -646,6 +662,7 @@ class KNXProxy:
                 if time.monotonic() - sess.last_seen > self.SESSION_TIMEOUT:
                     log.info(f"Session {sess.channel_id} timed out")
                     with self.lock: self.sessions.pop(sess.channel_id, None)
+                    self._notify_backend_disconnect(sess)
                     sess.close()
                 continue
             except Exception as e:
@@ -668,6 +685,7 @@ class KNXProxy:
 
         if sess.alive:
             with self.lock: self.sessions.pop(sess.channel_id, None)
+            self._notify_backend_disconnect(sess)
             sess.close()
 
     # ------------------------------------------------------------------
@@ -801,7 +819,9 @@ class KNXProxy:
         finally:
             if ch_id is not None:
                 with self.lock: sess = self.sessions.pop(ch_id, None)
-                if sess: sess.close()
+                if sess:
+                    self._notify_backend_disconnect(sess)
+                    sess.close()
             try: sock.close()
             except Exception: pass
             log.info(f"TCP client {addr[0]}:{addr[1]} disconnected")
@@ -830,7 +850,10 @@ class KNXProxy:
                 stale = [ch for ch, s in self.sessions.items()
                          if now - s.last_seen > self.SESSION_TIMEOUT]
                 for ch in stale:
-                    log.info(f"Session {ch} timed out"); self.sessions.pop(ch).close()
+                    log.info(f"Session {ch} timed out")
+                    s = self.sessions.pop(ch)
+                    self._notify_backend_disconnect(s)
+                    s.close()
 
     # ------------------------------------------------------------------
     # Main
@@ -850,7 +873,9 @@ class KNXProxy:
             threading.Thread(target=self._dispatch_udp, args=(data, addr), daemon=True).start()
 
         with self.lock:
-            for s in self.sessions.values(): s.close()
+            for s in self.sessions.values():
+                self._notify_backend_disconnect(s)
+                s.close()
             self.sessions.clear()
         for s in (self.udp, self.tcp_srv):
             try: s.close()
