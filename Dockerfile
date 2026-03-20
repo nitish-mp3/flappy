@@ -6,7 +6,8 @@ RUN apk add --no-cache \
     haproxy \
     curl \
     ca-certificates \
-    jq
+    jq \
+    socat
 
 # Copy rootfs (s6-overlay compatible service structure)
 COPY rootfs /
