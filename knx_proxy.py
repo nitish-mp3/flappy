@@ -7,7 +7,7 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.0"
+VERSION      = "2.6.2"
 BACKEND_FILE = "/run/knx-active-backend"
 MAGIC        = b'\x06\x10'
 
@@ -154,7 +154,8 @@ class Session:
             if self.backend_type == 'tcp':
                 self.backend_sock.sendall(data)
             else:
-                self.backend_sock.sendto(data, self.backend_addr)
+                # UDP backend socket is connected to backend endpoint.
+                self.backend_sock.send(data)
             return True
         except Exception as e:
             log.debug(f"send_to_backend ch={self.channel_id}: {e}")
@@ -243,6 +244,9 @@ class KNXProxy:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(5.0)
             s.bind(('0.0.0.0', 0))
+            # Connect UDP socket so kernel selects a concrete source IP/port
+            # and we can use send()/recv() reliably for this backend session.
+            s.connect((host, port))
             return s
 
     def _create_session(self, client_type, client_ctrl, client_data, client_sock, connect_body):
@@ -263,15 +267,23 @@ class KNXProxy:
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
             return
 
-        b_local_port  = bsock.getsockname()[1]
+        b_local_ip, b_local_port = bsock.getsockname()[0], bsock.getsockname()[1]
         b_hpai_proto  = PROTO_TCP if b_proto == 'tcp' else PROTO_UDP
 
         _, _, _, off = parse_hpai(connect_body, 0)
         _, _, _, off = parse_hpai(connect_body, off)
         cri = connect_body[off:]
 
-        new_body  = (make_hpai('0.0.0.0', b_local_port, b_hpai_proto) +
-                     make_hpai('0.0.0.0', b_local_port, b_hpai_proto) + cri)
+        # Backend-facing CONNECT translation:
+        # - UDP backends generally expect classic tunneling v1 CRI.
+        # - TCP backends can use client CRI as-is.
+        if b_proto == 'udp':
+            backend_cri = b'\x04\x04\x02\x00'
+        else:
+            backend_cri = cri if cri else b'\x04\x04\x02\x00'
+
+        new_body  = (make_hpai(b_local_ip, b_local_port, b_hpai_proto) +
+                     make_hpai(b_local_ip, b_local_port, b_hpai_proto) + backend_cri)
         req_frame = make_frame(CONNECT_REQ, new_body)
 
         try:
@@ -279,8 +291,8 @@ class KNXProxy:
                 bsock.sendall(req_frame)
                 resp_svc, resp_body = read_tcp_frame(bsock)
             else:
-                bsock.sendto(req_frame, (b_host, b_port))
-                raw, _ = bsock.recvfrom(1024)
+                bsock.send(req_frame)
+                raw = bsock.recv(1024)
                 resp_svc, resp_body = parse_frame(raw)
         except socket.timeout:
             log.error(f"Backend {b_host}:{b_port} CONNECT_REQUEST timed out")
@@ -293,8 +305,10 @@ class KNXProxy:
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
             return
 
-        if resp_svc != CONNECT_RESP or not resp_body or len(resp_body) < 10:
-            log.error(f"Bad CONNECT_RESP from backend: svc=0x{resp_svc:04x}")
+        if resp_svc != CONNECT_RESP or not resp_body or len(resp_body) < 2:
+            svc_txt = f"0x{resp_svc:04x}" if resp_svc is not None else "none"
+            body_txt = resp_body.hex() if resp_body else "none"
+            log.error(f"Bad CONNECT_RESP from backend: svc={svc_txt} body={body_txt}")
             bsock.close()
             self._send_connect_error(client_type, client_ctrl, client_sock, 0x26)
             return
@@ -305,11 +319,17 @@ class KNXProxy:
         if status != 0x00:
             log.warning(f"Backend refused CONNECT: status=0x{status:02x}")
             bsock.close()
-            self._send_raw(make_frame(CONNECT_RESP, resp_body), client_type, client_ctrl, client_sock)
+            # Return explicit error in client-facing format.
+            self._send_connect_error(client_type, client_ctrl, client_sock, status)
             return
 
-        _, _, _, r_off = parse_hpai(resp_body, 2)
-        crd = resp_body[r_off:]
+        crd = b'\x04\x04\x00\x00'
+        if len(resp_body) >= 10:
+            _, _, _, r_off = parse_hpai(resp_body, 2)
+            if r_off < len(resp_body):
+                crd = resp_body[r_off:]
+        elif len(resp_body) > 2:
+            crd = resp_body[2:]
 
         c_proto  = PROTO_TCP if client_type == 'tcp' else PROTO_UDP
         c_resp   = bytes([ch_id, 0x00]) + make_hpai('0.0.0.0', self.port, c_proto) + crd
