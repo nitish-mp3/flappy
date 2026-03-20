@@ -7,12 +7,16 @@ Handles all 4 combinations: UDP↔UDP, UDP↔TCP, TCP↔UDP, TCP↔TCP
 import socket, struct, threading, time, logging, os, sys, signal
 from typing import Optional, Tuple
 
-VERSION      = "2.6.2"
+VERSION      = "2.6.3"
 BACKEND_FILE = "/run/knx-active-backend"
 MAGIC        = b'\x06\x10'
 
+SEARCH_REQ       = 0x0201
+SEARCH_RESP      = 0x0202
 DESCRIPTION_REQ  = 0x0203
 DESCRIPTION_RESP = 0x0204
+SEARCH_REQ_EXT   = 0x020B
+SEARCH_RESP_EXT  = 0x020C
 CONNECT_REQ      = 0x0205
 CONNECT_RESP     = 0x0206
 CONNSTATE_REQ    = 0x0207
@@ -115,7 +119,7 @@ def read_backend() -> Optional[Tuple[str, int, str]]:
 # ---------------------------------------------------------------------------
 # DESCRIPTION_RESPONSE — advertises both UDP v1 and TCP v2
 # ---------------------------------------------------------------------------
-def _build_desc_resp() -> bytes:
+def _build_dib_payload() -> bytes:
     name = b'KNX Failover Proxy\x00'
     name = name + bytes(30 - len(name))
     dib1 = (b'\x36\x01\x02\x00\xff\x00\x00\x00'
@@ -123,8 +127,18 @@ def _build_desc_resp() -> bytes:
              b'\xe0\x00\x17\x0c'
              b'\x00\x00\x00\x00\x00\x00') + name
     dib2 = b'\x0a\x02\x02\x02\x03\x02\x04\x02\x04\x01'
-    return make_frame(DESCRIPTION_RESP, dib1 + dib2)
+    return dib1 + dib2
 
+def _build_desc_resp() -> bytes:
+    return make_frame(DESCRIPTION_RESP, DIB_PAYLOAD)
+
+def _build_search_resp(port: int, svc: int) -> bytes:
+    # KNX SEARCH response requires an HPAI endpoint + DIB payload.
+    # Use 0.0.0.0 with port to remain NAT/container friendly.
+    body = make_hpai('0.0.0.0', port, PROTO_UDP) + DIB_PAYLOAD
+    return make_frame(svc, body)
+
+DIB_PAYLOAD = _build_dib_payload()
 DESCRIPTION_RESPONSE = _build_desc_resp()
 
 
@@ -282,8 +296,15 @@ class KNXProxy:
         else:
             backend_cri = cri if cri else b'\x04\x04\x02\x00'
 
-        new_body  = (make_hpai(b_local_ip, b_local_port, b_hpai_proto) +
-                     make_hpai(b_local_ip, b_local_port, b_hpai_proto) + backend_cri)
+        # For UDP backend tunneling, advertise 0.0.0.0:<port> in HPAI to keep
+        # reply routing NAT/container-safe while preserving our bound source port.
+        if b_proto == 'udp':
+            hpai_ip = '0.0.0.0'
+        else:
+            hpai_ip = b_local_ip
+
+        new_body  = (make_hpai(hpai_ip, b_local_port, b_hpai_proto) +
+                     make_hpai(hpai_ip, b_local_port, b_hpai_proto) + backend_cri)
         req_frame = make_frame(CONNECT_REQ, new_body)
 
         try:
@@ -429,6 +450,16 @@ class KNXProxy:
             log.info(f"DESCRIPTION_REQUEST → sending response")
             try: self.udp.sendto(DESCRIPTION_RESPONSE, addr)
             except Exception as e: log.error(f"DESCRIPTION_RESPONSE failed: {e}")
+
+        elif svc == SEARCH_REQ:
+            log.info("SEARCH_REQUEST → sending SEARCH_RESPONSE")
+            try: self.udp.sendto(_build_search_resp(self.port, SEARCH_RESP), addr)
+            except Exception as e: log.error(f"SEARCH_RESPONSE failed: {e}")
+
+        elif svc == SEARCH_REQ_EXT:
+            log.info("SEARCH_REQUEST_EXT → sending SEARCH_RESPONSE_EXT")
+            try: self.udp.sendto(_build_search_resp(self.port, SEARCH_RESP_EXT), addr)
+            except Exception as e: log.error(f"SEARCH_RESPONSE_EXT failed: {e}")
 
         elif svc == CONNECT_REQ:
             if not body or len(body) < 16: return
