@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# KNX Failover Proxy v2.4.0  — backend manager
+# KNX Failover Proxy v2.6.1  — backend manager
 # =============================================================================
 # This script:
 #   1. Detects each interface protocol (tcp or udp) by probing
@@ -11,7 +11,7 @@
 #
 # knx_proxy.py handles ALL connection logic (TCP/UDP client × TCP/UDP backend)
 # =============================================================================
-set -uo pipefail
+set -euo pipefail
 
 readonly OPTIONS_FILE="/data/options.json"
 readonly STATE_FILE="/run/knx-haproxy.state"
@@ -20,7 +20,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.0"
+readonly VERSION="2.6.1"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -33,6 +33,7 @@ LISTEN_PORT=""  UDP_BRIDGE_PORT=""
 USB_DEVICE=""   USB_BAUD=""
 CHECK_INTERVAL="" CHECK_FALL="" CHECK_RISE=""
 LOG_LEVEL=""    USB_PRIORITY=""   NOTIFY_ON_FAILOVER=""
+CONNECTION_TIMEOUT="" PREFER_PROTOCOL=""
 
 CURRENT_STATE=""
 SOCAT_PID=""
@@ -88,6 +89,8 @@ load_config() {
     CHECK_INTERVAL="$(read_option health_check_interval 5)"
     CHECK_FALL="$(read_option health_check_fall 3)"
     CHECK_RISE="$(read_option health_check_rise 2)"
+    CONNECTION_TIMEOUT="$(read_option connection_timeout 5)"
+    PREFER_PROTOCOL="$(read_option prefer_protocol tcp)"
     LOG_LEVEL="$(read_option log_level info)"
     USB_DEVICE="$(read_option usb_device '')"
     USB_BAUD="$(read_option usb_baud 19200)"
@@ -104,7 +107,9 @@ load_config() {
     validate_pos_int "$CHECK_INTERVAL"  health_check_interval
     validate_pos_int "$CHECK_FALL"      health_check_fall
     validate_pos_int "$CHECK_RISE"      health_check_rise
+    validate_pos_int "$CONNECTION_TIMEOUT" connection_timeout
     validate_pos_int "$USB_BAUD"        usb_baud
+    [[ "$PREFER_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "prefer_protocol must be one of: tcp, udp, auto"
     [[ "$LISTEN_PORT" != "$UDP_BRIDGE_PORT" ]] || die "listen_port and udp_bridge_port must differ"
 }
 
@@ -130,39 +135,73 @@ ha_notify() {
 # Probes an endpoint and returns "tcp", "udp", or "none"
 # ---------------------------------------------------------------------------
 detect_protocol() {
-    # Detect KNX protocol by sending actual KNX DESCRIPTION_REQUEST frames.
-    # A raw TCP socket connect test is NOT sufficient — many KNX interfaces
-    # accept TCP connections for web/management but only speak KNX over UDP.
+    # Detect KNX protocol by requiring a valid KNX DESCRIPTION_RESPONSE.
+    # This avoids false positives from plain socket-open checks.
     local host="$1" port="$2"
+    python3 - "$host" "$port" "$PREFER_PROTOCOL" "$CONNECTION_TIMEOUT" << 'PYEOF'
+import socket
+import struct
+import sys
 
-    # 1. Try KNX UDP: send DESCRIPTION_REQUEST, expect DESCRIPTION_RESPONSE
-    #    (service type 0x0203 → 0x0204)
-    if printf '\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57' | \
-            timeout 3 socat -T2 STDIO "UDP:${host}:${port}" >/dev/null 2>&1; then
-        echo "udp"; return
-    fi
+host = sys.argv[1]
+port = int(sys.argv[2])
+prefer = sys.argv[3]
+timeout_s = max(1, int(sys.argv[4]))
 
-    # 2. Try KNX TCP: connect, send DESCRIPTION_REQUEST over TCP, check for
-    #    a valid KNX response (starts with 06 10)
-    if python3 - << 'PYEOF' 2>/dev/null
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(3)
-try:
-    s.connect(("'"${host}"'", '"${port}"'))
-    s.sendall(b"\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57")
-    data = s.recv(64)
-    sys.exit(0 if len(data) >= 2 and data[:2] == b"\x06\x10" else 1)
-except Exception:
-    sys.exit(1)
-finally:
-    s.close()
+REQ = b"\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57"
+
+def valid_desc_response(data: bytes) -> bool:
+    if len(data) < 6:
+        return False
+    if data[:2] != b"\x06\x10":
+        return False
+    svc = struct.unpack(">H", data[2:4])[0]
+    total = struct.unpack(">H", data[4:6])[0]
+    if svc != 0x0204:
+        return False
+    if total < 6 or len(data) < total:
+        return False
+    return True
+
+def probe_tcp() -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout_s)
+    try:
+        s.connect((host, port))
+        s.sendall(REQ)
+        data = s.recv(512)
+        return valid_desc_response(data)
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+def probe_udp() -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout_s)
+    try:
+        s.bind(("0.0.0.0", 0))
+        s.sendto(REQ, (host, port))
+        data, _ = s.recvfrom(512)
+        return valid_desc_response(data)
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+tcp_ok = probe_tcp()
+udp_ok = probe_udp()
+
+if prefer == "tcp":
+    result = "tcp" if tcp_ok else ("udp" if udp_ok else "none")
+elif prefer == "udp":
+    result = "udp" if udp_ok else ("tcp" if tcp_ok else "none")
+else:
+    # auto: prefer TCP for modern KNX tunnels when both are available
+    result = "tcp" if tcp_ok else ("udp" if udp_ok else "none")
+
+print(result)
 PYEOF
-    then
-        echo "tcp"; return
-    fi
-
-    echo "none"
 }
 
 usb_probe() {
@@ -457,6 +496,7 @@ main() {
     [[ -n "$USB_DEVICE" ]] && \
         log_info "USB:      ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY})"
     log_info "Health:   interval=${CHECK_INTERVAL}s fall=${CHECK_FALL} rise=${CHECK_RISE}"
+    log_info "Probe:    prefer_protocol=${PREFER_PROTOCOL} timeout=${CONNECTION_TIMEOUT}s"
 
     clear_backend
     start_proxy || die "Cannot start KNX proxy"

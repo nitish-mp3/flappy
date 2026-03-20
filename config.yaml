@@ -2,10 +2,10 @@
 name: KNX Failover Proxy
 slug: knx_haproxy
 description: >
-  KNX/IP failover proxy using knxd. Speaks the full KNX/IP protocol
-  (UDP + TCP, automatic DESCRIPTION/SEARCH responses). Supports TCP/IP,
-  UDP/IP, and USB/serial interfaces with automatic failover and recovery.
-version: "2.6.0"
+  KNX/IP failover proxy with full KNX/IP front-end support (UDP + TCP)
+  and automatic backend failover. Supports TCP/IP, UDP/IP, and USB/serial
+  interfaces with monitored recovery and seamless reconnect behavior.
+version: "2.6.2"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -19,6 +19,8 @@ boot: auto
 ports:
   3671/tcp: 3671
   3671/udp: 3671
+  3672/tcp: 3672
+  3672/udp: 3672
 
 options:
   primary_host: ""
@@ -31,6 +33,7 @@ options:
   listen_port: 3671
   log_level: info
   connection_timeout: 5
+  prefer_protocol: tcp
   health_check_interval: 5
   health_check_fall: 3
   health_check_rise: 2
@@ -48,6 +51,7 @@ schema:
   listen_port: port
   log_level: list(debug|info|warning|error)?
   connection_timeout: int(1,)?
+  prefer_protocol: list(tcp|udp|auto)?
   health_check_interval: int(1,)?
   health_check_fall: int(1,)?
   health_check_rise: int(1,)?
