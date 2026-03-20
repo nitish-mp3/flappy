@@ -1,8 +1,11 @@
 ---
 name: KNX HAProxy
 slug: knx_haproxy
-description: KNX TCP failover proxy with automatic backend selection
-version: "1.6.1"
+description: >
+  KNX/IP failover proxy with automatic backend selection.
+  Supports TCP, UDP (auto-bridged), and USB/serial interfaces.
+  Provides active-passive failover with configurable hysteresis.
+version: "2.0.0"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -12,41 +15,95 @@ arch:
   - i386
 startup: services
 boot: auto
+
+# ---------------------------------------------------------------------------
+# Environment (runtime overrides)
+# ---------------------------------------------------------------------------
 environment:
   LOG_LEVEL: info
+
+# ---------------------------------------------------------------------------
+# Port exposure
+# ---------------------------------------------------------------------------
 ports:
   3672/tcp: 3672
+
+# ---------------------------------------------------------------------------
+# Default option values (shown in HA UI)
+# ---------------------------------------------------------------------------
 options:
+  # --- IP interfaces ---
   primary_host: ""
   primary_port: 3671
   backup_host: ""
   backup_port: 3671
+
+  # --- USB/serial interface (optional) ---
+  usb_device: ""
+  usb_baud: 19200
+  usb_priority: last_resort
+
+  # --- Listener ---
   udp_bridge_port: 13671
   listen_port: 3672
+
+  # --- Logging ---
   log_level: info
+
+  # --- Timeouts (seconds) ---
   connection_timeout: 5
-  client_timeout: 60
-  server_timeout: 60
-  health_check_interval: 2
-  health_check_fall: 2
-  health_check_rise: 1
+  client_timeout: 300
+  server_timeout: 300
+
+  # --- Health check hysteresis ---
+  health_check_interval: 5
+  health_check_fall: 3
+  health_check_rise: 2
+
+  # --- Notifications ---
+  notify_on_failover: false
+
+# ---------------------------------------------------------------------------
+# Schema (type + constraints)
+# ---------------------------------------------------------------------------
 schema:
+  # IP interfaces
   primary_host: str
   primary_port: port
   backup_host: str
   backup_port: port
+
+  # USB/serial
+  usb_device: str?
+  usb_baud: int(1200,)?
+  usb_priority: list(last_resort|prefer)?
+
+  # Listener & internal bridge
   udp_bridge_port: port?
   listen_port: port
+
+  # Logging
   log_level: list(debug|info|warning|error)?
+
+  # Timeouts
   connection_timeout: int(1,)?
   client_timeout: int(1,)?
   server_timeout: int(1,)?
+
+  # Health check
   health_check_interval: int(1,)?
   health_check_fall: int(1,)?
   health_check_rise: int(1,)?
+
+  # Notifications
+  notify_on_failover: bool?
+
+# ---------------------------------------------------------------------------
+# Permissions
+# ---------------------------------------------------------------------------
 privileged: []
-uart: []
-udev: false
+uart: true        # enables USB/serial device access
+udev: true        # allows hotplug device detection
 access_token: false
 devices: []
 realtime: false

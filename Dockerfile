@@ -1,25 +1,46 @@
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
-# Install dependencies
+# ---------------------------------------------------------------------------
+# Runtime dependencies
+#   haproxy   — TCP proxy and health-checking layer
+#   socat     — TCP↔UDP bridge and USB/serial bridge
+#   jq        — JSON option parsing
+#   curl      — HA Supervisor API notifications
+#   iproute2  — optional: ss/ip for diagnostics
+# ---------------------------------------------------------------------------
 RUN apk add --no-cache \
     haproxy \
+    socat \
+    jq \
     curl \
     ca-certificates \
-    jq \
-    socat
+    iproute2
 
-# Copy rootfs (s6-overlay compatible service structure)
+# ---------------------------------------------------------------------------
+# Copy rootfs (s6-overlay service structure)
+# ---------------------------------------------------------------------------
 COPY rootfs /
 
+# ---------------------------------------------------------------------------
 # Copy main scripts and set permissions
-COPY run.sh /
-COPY healthcheck.sh /
-RUN chmod a+x /run.sh /healthcheck.sh \
-    && chmod a+x /etc/services.d/knx-haproxy/run \
-    && chmod a+x /etc/services.d/knx-haproxy/finish \
-    && chmod a+x /etc/cont-init.d/knx-haproxy.sh
+# ---------------------------------------------------------------------------
+COPY run.sh         /run.sh
+COPY healthcheck.sh /healthcheck.sh
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+RUN chmod 0755 \
+        /run.sh \
+        /healthcheck.sh \
+        /etc/cont-init.d/knx-haproxy.sh \
+        /etc/services.d/knx-haproxy/run \
+        /etc/services.d/knx-haproxy/finish
+
+# ---------------------------------------------------------------------------
+# Docker health check (used by HA to report addon status)
+# ---------------------------------------------------------------------------
+HEALTHCHECK \
+    --interval=30s \
+    --timeout=10s \
+    --start-period=20s \
+    --retries=3 \
     CMD /healthcheck.sh
