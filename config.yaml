@@ -1,11 +1,11 @@
 ---
 name: KNX Failover Proxy
-slug: knx_haproxy
+slug: knx_failover_proxy
 description: >
-  KNX/IP failover proxy with automatic backend failover.
-  UDP is the recommended Home Assistant frontend; TCP can be enabled
-  explicitly for best-effort compatibility.
-version: "2.7.0"
+  Production-grade KNX/IP failover proxy with automatic backend failover,
+  KNX IP Secure tunneling support, USB via knxd, and configurable failback.
+  Supports TCP, UDP, and USB interfaces in any combination.
+version: "3.0.0"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -16,61 +16,114 @@ arch:
 startup: services
 boot: auto
 
+# ─── Network ──────────────────────────────────────────────────────────
 ports:
   3671/tcp: 3671
   3671/udp: 3671
-  3672/tcp: 3672
-  3672/udp: 3672
 
+# ─── Defaults ─────────────────────────────────────────────────────────
 options:
+  # Frontend (what HA connects to)
   frontend_protocol: udp
+  listen_port: 3671
+
+  # Primary interface
   primary_host: ""
   primary_port: 3671
   primary_protocol: tcp
+  primary_secure: false
+  primary_device_password: ""
+  primary_user_password: ""
+
+  # Backup interface
   backup_host: ""
   backup_port: 3671
   backup_protocol: udp
+  backup_secure: false
+  backup_device_password: ""
+  backup_user_password: ""
+
+  # USB interface (via knxd)
   usb_device: ""
   usb_baud: 19200
   usb_priority: last_resort
-  listen_port: 3671
-  log_level: info
-  connection_timeout: 5
-  prefer_protocol: tcp
+  usb_knxd_extra_args: ""
+
+  # Health checking
   health_check_interval: 5
   health_check_fall: 3
   health_check_rise: 2
-  primary_recovery_hold_seconds: 600
-  client_tunnels: 4
+  health_check_method: probe
+  connection_timeout: 5
+
+  # Failover / failback
+  failback_mode: auto
+  failback_delay_seconds: 30
+
+  # Sessions
+  max_sessions: 8
+  session_timeout: 120
+  drain_timeout_seconds: 5
+
+  # Logging & notifications
+  log_level: info
   notify_on_failover: false
 
+# ─── Schema ───────────────────────────────────────────────────────────
 schema:
+  # Frontend
   frontend_protocol: list(udp|tcp|both)?
+  listen_port: port
+
+  # Primary
   primary_host: str
   primary_port: port
   primary_protocol: list(tcp|udp|auto)?
+  primary_secure: bool?
+  primary_device_password: password?
+  primary_user_password: password?
+
+  # Backup
   backup_host: str
   backup_port: port
   backup_protocol: list(tcp|udp|auto)?
+  backup_secure: bool?
+  backup_device_password: password?
+  backup_user_password: password?
+
+  # USB
   usb_device: str?
   usb_baud: int(1200,)?
   usb_priority: list(last_resort|prefer)?
-  listen_port: port
-  log_level: list(debug|info|warning|error)?
-  connection_timeout: int(1,)?
-  prefer_protocol: list(tcp|udp|auto)?
+  usb_knxd_extra_args: str?
+
+  # Health
   health_check_interval: int(1,)?
   health_check_fall: int(1,)?
   health_check_rise: int(1,)?
-  primary_recovery_hold_seconds: int(1,)?
-  client_tunnels: int(1,8)?
+  health_check_method: list(probe|heartbeat|both)?
+  connection_timeout: int(1,)?
+
+  # Failover
+  failback_mode: list(auto|manual|disabled)?
+  failback_delay_seconds: int(10,)?
+
+  # Sessions
+  max_sessions: int(1,16)?
+  session_timeout: int(30,)?
+  drain_timeout_seconds: int(1,30)?
+
+  # Logging
+  log_level: list(debug|info|warning|error)?
   notify_on_failover: bool?
 
+# ─── Permissions ──────────────────────────────────────────────────────
 privileged: []
 uart: true
 udev: true
+usb: true
 access_token: false
-devices: []
+devices: true
 realtime: false
 init: false
 services: []

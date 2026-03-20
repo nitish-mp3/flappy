@@ -1,55 +1,58 @@
 #!/bin/bash
 # =============================================================================
-# KNX Failover Proxy v2.6.1  — backend manager
+# KNX Failover Proxy v3.0.0  — Backend Manager
 # =============================================================================
 # This script:
-#   1. Detects each interface protocol (tcp or udp) by probing
-#   2. Writes host:port:proto to /run/knx-active-backend
-#   3. Sends SIGHUP to knx_proxy.py on every backend change
-#      → proxy drops sessions, HA reconnects to new backend
-#   4. Monitors and recovers interfaces in the background
-#
-# knx_proxy.py handles ALL connection logic (TCP/UDP client × TCP/UDP backend)
+#   1. Loads config from /data/options.json
+#   2. Detects interface protocols and selects best available backend
+#   3. Manages knxd for USB interfaces (or falls back to socat)
+#   4. Monitors health and triggers failover/failback
+#   5. Manages the KNX proxy process lifecycle
 # =============================================================================
 set -euo pipefail
 
 readonly OPTIONS_FILE="/data/options.json"
-readonly STATE_FILE="/run/knx-haproxy.state"
+readonly STATE_FILE="/run/knx-failover.state"
 readonly BACKEND_FILE="/run/knx-active-backend"
 readonly BACKEND_REJECT_FILE="/run/knx-backend-reject"
+readonly METRICS_FILE="/run/knx-metrics.json"
+readonly KNXD_PID_FILE="/run/knxd.pid"
 readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="2.6.27"
+readonly VERSION="3.0.0"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
 readonly STATE_USB="USB"
 readonly STATE_DEGRADED="DEGRADED"
+readonly STATE_FAILBACK_PENDING="FAILBACK_PENDING"
 
-PRIMARY_HOST="" PRIMARY_PORT=""
-BACKUP_HOST=""  BACKUP_PORT=""
-PRIMARY_PROTOCOL="" BACKUP_PROTOCOL=""
-FRONTEND_PROTOCOL=""
-LISTEN_PORT=""  UDP_BRIDGE_PORT=""
-USB_DEVICE=""   USB_BAUD=""
-CHECK_INTERVAL="" CHECK_FALL="" CHECK_RISE=""
-LOG_LEVEL=""    USB_PRIORITY=""   NOTIFY_ON_FAILOVER=""
-CONNECTION_TIMEOUT="" PREFER_PROTOCOL=""
-PRIMARY_RECOVERY_HOLD_SECS=""
+# -- Config vars ---
+PRIMARY_HOST="" PRIMARY_PORT="" PRIMARY_PROTOCOL="" PRIMARY_SECURE=""
+BACKUP_HOST="" BACKUP_PORT="" BACKUP_PROTOCOL="" BACKUP_SECURE=""
+PRIMARY_DEVICE_PW="" PRIMARY_USER_PW=""
+BACKUP_DEVICE_PW="" BACKUP_USER_PW=""
+FRONTEND_PROTOCOL="" LISTEN_PORT=""
+USB_DEVICE="" USB_BAUD="" USB_PRIORITY="" USB_KNXD_EXTRA=""
+CHECK_INTERVAL="" CHECK_FALL="" CHECK_RISE="" CHECK_METHOD=""
+CONNECTION_TIMEOUT=""
+FAILBACK_MODE="" FAILBACK_DELAY=""
+MAX_SESSIONS="" SESSION_TIMEOUT="" DRAIN_TIMEOUT=""
+LOG_LEVEL="" NOTIFY_ON_FAILOVER=""
 
+# -- Runtime state ---
 CURRENT_STATE=""
+KNXD_PID=""
 SOCAT_PID=""
 PROXY_PID=""
-
 PRIMARY_FAIL_COUNT=0
 PRIMARY_RISE_COUNT=0
 BACKUP_FAIL_COUNT=0
-PRIMARY_CONNECT_REJECT_COUNT=0
-BACKUP_CONNECT_REJECT_COUNT=0
-PRIMARY_TCP_RETRY_DONE=0
 PRIMARY_HOLD_UNTIL=0
+HAS_KNXD=false
+USB_LOCAL_PORT=13671
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -88,26 +91,54 @@ validate_pos_int() {
 
 load_config() {
     [[ -f "$OPTIONS_FILE" ]] || die "Missing $OPTIONS_FILE"
+
+    # Primary
     PRIMARY_HOST="$(read_option primary_host '')"
     PRIMARY_PORT="$(read_option primary_port 3671)"
-    PRIMARY_PROTOCOL="$(read_option primary_protocol auto)"
+    PRIMARY_PROTOCOL="$(read_option primary_protocol tcp)"
+    PRIMARY_SECURE="$(read_option primary_secure false)"
+    PRIMARY_DEVICE_PW="$(read_option primary_device_password '')"
+    PRIMARY_USER_PW="$(read_option primary_user_password '')"
+
+    # Backup
     BACKUP_HOST="$(read_option backup_host '')"
     BACKUP_PORT="$(read_option backup_port 3671)"
-    BACKUP_PROTOCOL="$(read_option backup_protocol auto)"
+    BACKUP_PROTOCOL="$(read_option backup_protocol udp)"
+    BACKUP_SECURE="$(read_option backup_secure false)"
+    BACKUP_DEVICE_PW="$(read_option backup_device_password '')"
+    BACKUP_USER_PW="$(read_option backup_user_password '')"
+
+    # Frontend
     FRONTEND_PROTOCOL="$(read_option frontend_protocol udp)"
-    LISTEN_PORT="$(read_option listen_port 3672)"
-    UDP_BRIDGE_PORT="$(read_option udp_bridge_port 13671)"
-    CHECK_INTERVAL="$(read_option health_check_interval 5)"
-    CHECK_FALL="$(read_option health_check_fall 3)"
-    CHECK_RISE="$(read_option health_check_rise 2)"
-    CONNECTION_TIMEOUT="$(read_option connection_timeout 5)"
-    PREFER_PROTOCOL="$(read_option prefer_protocol tcp)"
-    PRIMARY_RECOVERY_HOLD_SECS="$(read_option primary_recovery_hold_seconds 600)"
-    LOG_LEVEL="$(read_option log_level info)"
+    LISTEN_PORT="$(read_option listen_port 3671)"
+
+    # USB
     USB_DEVICE="$(read_option usb_device '')"
     USB_BAUD="$(read_option usb_baud 19200)"
     USB_PRIORITY="$(read_option usb_priority last_resort)"
+    USB_KNXD_EXTRA="$(read_option usb_knxd_extra_args '')"
+
+    # Health
+    CHECK_INTERVAL="$(read_option health_check_interval 5)"
+    CHECK_FALL="$(read_option health_check_fall 3)"
+    CHECK_RISE="$(read_option health_check_rise 2)"
+    CHECK_METHOD="$(read_option health_check_method probe)"
+    CONNECTION_TIMEOUT="$(read_option connection_timeout 5)"
+
+    # Failover/Failback
+    FAILBACK_MODE="$(read_option failback_mode auto)"
+    FAILBACK_DELAY="$(read_option failback_delay_seconds 30)"
+
+    # Sessions
+    MAX_SESSIONS="$(read_option max_sessions 8)"
+    SESSION_TIMEOUT="$(read_option session_timeout 120)"
+    DRAIN_TIMEOUT="$(read_option drain_timeout_seconds 5)"
+
+    # Logging
+    LOG_LEVEL="$(read_option log_level info)"
     NOTIFY_ON_FAILOVER="$(read_option notify_on_failover false)"
+
+    # Validation
     [[ -n "$PRIMARY_HOST" ]] || die "primary_host is required"
     [[ -n "$BACKUP_HOST"  ]] || die "backup_host is required"
     is_valid_host "$PRIMARY_HOST" || die "primary_host invalid: $PRIMARY_HOST"
@@ -115,49 +146,32 @@ load_config() {
     validate_port    "$PRIMARY_PORT"    primary_port
     validate_port    "$BACKUP_PORT"     backup_port
     validate_port    "$LISTEN_PORT"     listen_port
-    validate_port    "$UDP_BRIDGE_PORT" udp_bridge_port
     validate_pos_int "$CHECK_INTERVAL"  health_check_interval
     validate_pos_int "$CHECK_FALL"      health_check_fall
     validate_pos_int "$CHECK_RISE"      health_check_rise
     validate_pos_int "$CONNECTION_TIMEOUT" connection_timeout
-    validate_pos_int "$PRIMARY_RECOVERY_HOLD_SECS" primary_recovery_hold_seconds
-    validate_pos_int "$USB_BAUD"        usb_baud
-    [[ "$PRIMARY_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "primary_protocol must be one of: tcp, udp, auto"
-    [[ "$BACKUP_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "backup_protocol must be one of: tcp, udp, auto"
-    [[ "$FRONTEND_PROTOCOL" =~ ^(udp|tcp|both)$ ]] || die "frontend_protocol must be one of: udp, tcp, both"
-    [[ "$PREFER_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "prefer_protocol must be one of: tcp, udp, auto"
-    [[ "$LISTEN_PORT" != "$UDP_BRIDGE_PORT" ]] || die "listen_port and udp_bridge_port must differ"
+    validate_pos_int "$FAILBACK_DELAY" failback_delay_seconds
+    validate_pos_int "$USB_BAUD"       usb_baud
+    validate_pos_int "$MAX_SESSIONS"   max_sessions
+    validate_pos_int "$SESSION_TIMEOUT" session_timeout
+    validate_pos_int "$DRAIN_TIMEOUT"  drain_timeout_seconds
 
-    # Deterministic safety behavior for legacy configs that still have auto/auto.
-    # This prevents repeatedly selecting a discovery-only UDP path on primary.
+    [[ "$PRIMARY_PROTOCOL" =~ ^(tcp|udp|auto)$ ]] || die "primary_protocol invalid"
+    [[ "$BACKUP_PROTOCOL" =~ ^(tcp|udp|auto)$ ]]  || die "backup_protocol invalid"
+    [[ "$FRONTEND_PROTOCOL" =~ ^(udp|tcp|both)$ ]] || die "frontend_protocol invalid"
+    [[ "$FAILBACK_MODE" =~ ^(auto|manual|disabled)$ ]] || die "failback_mode invalid"
+    [[ "$CHECK_METHOD" =~ ^(probe|heartbeat|both)$ ]] || die "health_check_method invalid"
+
+    # Deterministic fallback when both are auto
     if [[ "$PRIMARY_PROTOCOL" == "auto" && "$BACKUP_PROTOCOL" == "auto" ]]; then
         PRIMARY_PROTOCOL="tcp"
         BACKUP_PROTOCOL="udp"
     fi
-}
 
-set_primary_holdoff() {
-    local reason="${1:-primary-unstable}"
-    local now
-    now="$(date +%s)"
-    PRIMARY_HOLD_UNTIL=$(( now + PRIMARY_RECOVERY_HOLD_SECS ))
-    log_warn "Holding primary recovery for ${PRIMARY_RECOVERY_HOLD_SECS}s (${reason})"
-}
-
-is_primary_holdoff_active() {
-    local now
-    now="$(date +%s)"
-    [[ "$now" -lt "$PRIMARY_HOLD_UNTIL" ]]
-}
-
-primary_holdoff_remaining() {
-    local now remain
-    now="$(date +%s)"
-    remain=$(( PRIMARY_HOLD_UNTIL - now ))
-    if [[ "$remain" -lt 0 ]]; then
-        remain=0
+    # Check knxd availability
+    if command -v knxd >/dev/null 2>&1; then
+        HAS_KNXD=true
     fi
-    echo "$remain"
 }
 
 select_backend_proto() {
@@ -187,232 +201,21 @@ ha_notify() {
 }
 
 # ---------------------------------------------------------------------------
-# Protocol detection
-# Probes an endpoint and returns "tcp", "udp", or "none"
+# Protocol detection (delegates to Python health module)
 # ---------------------------------------------------------------------------
 detect_protocol() {
-    # Detect KNX protocol by requiring both:
-    # 1) valid KNX DESCRIPTION_RESPONSE
-    # 2) successful KNX CONNECT/RESP tunnel negotiation
-    # This avoids selecting endpoints that answer discovery but reject tunneling.
     local host="$1" port="$2"
-    python3 - "$host" "$port" "$PREFER_PROTOCOL" "$CONNECTION_TIMEOUT" << 'PYEOF'
-import socket
-import struct
+    local prefer="${PRIMARY_PROTOCOL}"
+    [[ "$prefer" == "auto" ]] && prefer="tcp"
+    python3 - "$host" "$port" "$prefer" "$CONNECTION_TIMEOUT" <<'PYEOF'
 import sys
-
+sys.path.insert(0, '/')
+from knx_health import detect_protocol
 host = sys.argv[1]
 port = int(sys.argv[2])
 prefer = sys.argv[3]
-timeout_s = max(1, int(sys.argv[4]))
-
-REQ = b"\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57"
-MAGIC = b"\x06\x10"
-
-PROTO_UDP = 0x01
-PROTO_TCP = 0x06
-
-CONNECT_RESP = 0x0206
-
-def make_frame(svc: int, body: bytes) -> bytes:
-    return MAGIC + struct.pack(">HH", svc, 6 + len(body)) + body
-
-def make_hpai(ip: str, port: int, proto: int) -> bytes:
-    return bytes([8, proto]) + socket.inet_aton(ip) + struct.pack(">H", port)
-
-def build_connect_req(
-    ctrl_ip: str,
-    ctrl_port: int,
-    ctrl_proto: int,
-    data_ip: str,
-    data_port: int,
-    data_proto: int,
-    cri: bytes,
-) -> bytes:
-    # TUNNELING connection request (CRI 04 04 02 00)
-    return make_frame(
-        0x0205,
-        make_hpai(ctrl_ip, ctrl_port, ctrl_proto)
-        + make_hpai(data_ip, data_port, data_proto)
-        + cri,
-    )
-
-def parse_frame(data: bytes):
-    if len(data) < 6 or data[:2] != MAGIC:
-        return None, None
-    svc = struct.unpack(">H", data[2:4])[0]
-    total = struct.unpack(">H", data[4:6])[0]
-    if total < 6 or total > len(data):
-        return None, None
-    return svc, data[6:total]
-
-def parse_connect_status(raw: bytes):
-    svc, body = parse_frame(raw)
-    if svc != CONNECT_RESP or body is None or len(body) < 2:
-        return None, None
-    return body[1], body
-
-def send_disconnect_udp(sock: socket.socket, host: str, port: int, channel_id: int):
-    # Best-effort release of probe tunnel slot.
-    body = bytes([channel_id, 0x00]) + make_hpai("0.0.0.0", 0, PROTO_UDP)
-    sock.sendto(make_frame(0x0209, body), (host, port))
-
-def send_disconnect_tcp(sock: socket.socket, channel_id: int):
-    body = bytes([channel_id, 0x00]) + make_hpai("0.0.0.0", 0, PROTO_TCP)
-    sock.sendall(make_frame(0x0209, body))
-
-def valid_desc_response(data: bytes) -> bool:
-    if len(data) < 6:
-        return False
-    if data[:2] != b"\x06\x10":
-        return False
-    svc = struct.unpack(">H", data[2:4])[0]
-    total = struct.unpack(">H", data[4:6])[0]
-    if svc != 0x0204:
-        return False
-    if total < 6 or len(data) < total:
-        return False
-    return True
-
-def probe_tcp() -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout_s)
-    try:
-        s.connect((host, port))
-        s.sendall(REQ)
-        data = s.recv(512)
-        return valid_desc_response(data)
-    except Exception:
-        return False
-    finally:
-        s.close()
-
-def probe_tcp_tunnel() -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout_s)
-    try:
-        s.connect((host, port))
-        local_ip, local_port = s.getsockname()
-
-        cri_variants = [
-            b"\x04\x04\x02\x00",
-            b"\x04\x04\x04\x00",
-        ]
-
-        hpai_variants = [
-            ("0.0.0.0", 0, PROTO_TCP, "0.0.0.0", 0, PROTO_TCP),
-            ("0.0.0.0", 0, PROTO_UDP, "0.0.0.0", 0, PROTO_UDP),
-            ("0.0.0.0", 0, PROTO_TCP, local_ip, local_port, PROTO_TCP),
-        ]
-
-        for cri in cri_variants:
-            for ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto in hpai_variants:
-                s.sendall(build_connect_req(ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto, cri))
-                hdr = s.recv(6)
-                if len(hdr) < 6 or hdr[:2] != MAGIC:
-                    continue
-                total = struct.unpack(">H", hdr[4:6])[0]
-                if total < 6:
-                    continue
-                body = b""
-                while len(body) < (total - 6):
-                    chunk = s.recv((total - 6) - len(body))
-                    if not chunk:
-                        break
-                    body += chunk
-                if len(body) != (total - 6):
-                    continue
-
-                status, cbody = parse_connect_status(hdr + body)
-                if status is None:
-                    continue
-                if status == 0x00 and cbody is not None and len(cbody) >= 1:
-                    try:
-                        send_disconnect_tcp(s, cbody[0])
-                    except Exception:
-                        pass
-                    return True
-        return False
-    except Exception:
-        return False
-    finally:
-        s.close()
-
-def probe_udp() -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout_s)
-    try:
-        s.bind(("0.0.0.0", 0))
-        s.sendto(REQ, (host, port))
-        data, _ = s.recvfrom(512)
-        return valid_desc_response(data)
-    except Exception:
-        return False
-    finally:
-        s.close()
-
-def probe_udp_tunnel() -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout_s)
-    try:
-        s.bind(("0.0.0.0", 0))
-        local_ip, local_port = s.getsockname()
-        cri_variants = [
-            b"\x04\x04\x02\x00",
-            b"\x04\x04\x04\x00",
-        ]
-
-        hpai_variants = [
-            ("0.0.0.0", 0, PROTO_UDP, "0.0.0.0", 0, PROTO_UDP),
-            ("0.0.0.0", 0, PROTO_UDP, "0.0.0.0", local_port, PROTO_UDP),
-            (local_ip, local_port, PROTO_UDP, local_ip, local_port, PROTO_UDP),
-            ("0.0.0.0", 0, PROTO_TCP, "0.0.0.0", 0, PROTO_TCP),
-        ]
-
-        for cri in cri_variants:
-            for ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto in hpai_variants:
-                s.sendto(build_connect_req(ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto, cri), (host, port))
-                raw, _ = s.recvfrom(1024)
-                status, body = parse_connect_status(raw)
-                if status is None:
-                    continue
-                if status == 0x00 and body is not None and len(body) >= 1:
-                    try:
-                        send_disconnect_udp(s, host, port, body[0])
-                    except Exception:
-                        pass
-                    return True
-        return False
-    except Exception:
-        return False
-    finally:
-        s.close()
-
-tcp_desc_ok = probe_tcp()
-udp_desc_ok = probe_udp()
-
-tcp_tunnel_ok = tcp_desc_ok and probe_tcp_tunnel()
-udp_tunnel_ok = udp_desc_ok and probe_udp_tunnel()
-
-tcp_ok = tcp_tunnel_ok
-udp_ok = udp_tunnel_ok
-
-# Safety net:
-# If tunnel probing fails but endpoint still answers KNX DESCRIPTION,
-# keep it eligible so proxy/runtime logic can still attempt live connect.
-if not tcp_ok and tcp_desc_ok:
-    tcp_ok = True
-if not udp_ok and udp_desc_ok:
-    udp_ok = True
-
-if prefer == "tcp":
-    result = "tcp" if tcp_ok else ("udp" if udp_ok else "none")
-elif prefer == "udp":
-    result = "udp" if udp_ok else ("tcp" if tcp_ok else "none")
-else:
-    # auto: prefer TCP for modern KNX tunnels when both are available
-    result = "tcp" if tcp_ok else ("udp" if udp_ok else "none")
-
+timeout = int(sys.argv[4])
+result = detect_protocol(host, port, prefer, timeout)
 print(result)
 PYEOF
 }
@@ -422,7 +225,7 @@ usb_probe() {
 }
 
 # ---------------------------------------------------------------------------
-# Backend file  — read by knx_proxy.py as "host:port:proto"
+# Backend file
 # ---------------------------------------------------------------------------
 set_backend() {
     local host="$1" port="$2" proto="$3"
@@ -437,43 +240,31 @@ clear_backend() {
 
 current_backend_proto() {
     [[ -f "$BACKEND_FILE" ]] || { echo ""; return 0; }
-    local line host port proto
+    local line proto
     line="$(cat "$BACKEND_FILE" 2>/dev/null || true)"
     [[ -n "$line" && "$line" != "none" ]] || { echo ""; return 0; }
-    host="${line%%:*}"
-    line="${line#*:}"
-    port="${line%%:*}"
-    proto="${line#*:}"
-    [[ -n "$host" && -n "$port" && -n "$proto" ]] || { echo ""; return 0; }
+    proto="${line##*:}"
     echo "$proto"
-    return 0
 }
 
 read_backend_reject_status() {
     local host="$1" port="$2"
     [[ -f "$BACKEND_REJECT_FILE" ]] || { echo ""; return 0; }
-
-    local r_host="" r_port="" r_status="" r_ts="" now age
+    local r_host r_port r_status r_ts now age
     r_host="$(awk -F= '$1=="host"{print $2; exit}' "$BACKEND_REJECT_FILE" 2>/dev/null || true)"
     r_port="$(awk -F= '$1=="port"{print $2; exit}' "$BACKEND_REJECT_FILE" 2>/dev/null || true)"
     r_status="$(awk -F= '$1=="status"{print $2; exit}' "$BACKEND_REJECT_FILE" 2>/dev/null || true)"
     r_ts="$(awk -F= '$1=="ts"{print $2; exit}' "$BACKEND_REJECT_FILE" 2>/dev/null || true)"
-
     [[ "$r_host" == "$host" ]] || { echo ""; return 0; }
     [[ "$r_port" == "$port" ]] || { echo ""; return 0; }
     [[ -n "$r_status" && -n "$r_ts" ]] || { echo ""; return 0; }
     is_int "$r_ts" || { echo ""; return 0; }
-
     now="$(date +%s)"
     age=$(( now - r_ts ))
-    # Ignore stale reject reports from old sessions.
     if [[ "$age" -gt 30 ]]; then
-        echo ""
-        return 0
+        echo ""; return 0
     fi
-
     echo "$r_status"
-    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -481,15 +272,26 @@ read_backend_reject_status() {
 # ---------------------------------------------------------------------------
 start_proxy() {
     stop_proxy
-    # Kill any stale knx_proxy.py from a previous run that didn't clean up
-    # (e.g. if the container was killed with SIGKILL instead of SIGTERM)
     pkill -f "knx_proxy.py" 2>/dev/null || true
     sleep 1
-    log_info "Starting KNX/IP proxy on port ${LISTEN_PORT} (TCP + UDP)"
-    FRONTEND_PROTOCOL="$FRONTEND_PROTOCOL" LOG_LEVEL="$LOG_LEVEL" python3 /knx_proxy.py "$LISTEN_PORT" &
+    log_info "Starting KNX/IP proxy on port ${LISTEN_PORT} (frontend=${FRONTEND_PROTOCOL})"
+
+    FRONTEND_PROTOCOL="$FRONTEND_PROTOCOL" \
+    LOG_LEVEL="$LOG_LEVEL" \
+    MAX_SESSIONS="$MAX_SESSIONS" \
+    SESSION_TIMEOUT="$SESSION_TIMEOUT" \
+    DRAIN_TIMEOUT="$DRAIN_TIMEOUT" \
+    PRIMARY_SECURE="$PRIMARY_SECURE" \
+    BACKUP_SECURE="$BACKUP_SECURE" \
+    PRIMARY_DEVICE_PASSWORD="$PRIMARY_DEVICE_PW" \
+    PRIMARY_USER_PASSWORD="$PRIMARY_USER_PW" \
+    BACKUP_DEVICE_PASSWORD="$BACKUP_DEVICE_PW" \
+    BACKUP_USER_PASSWORD="$BACKUP_USER_PW" \
+    python3 /knx_proxy.py "$LISTEN_PORT" &
+
     PROXY_PID="$!"
     echo "$PROXY_PID" > "$PROXY_PID_FILE"
-    sleep 1
+    sleep 2
     if ! kill -0 "$PROXY_PID" 2>/dev/null; then
         log_error "KNX proxy died immediately"
         PROXY_PID=""; rm -f "$PROXY_PID_FILE"; return 1
@@ -512,7 +314,6 @@ ensure_proxy_alive() {
 }
 
 reload_proxy() {
-    # SIGHUP drops all existing sessions → HA reconnects to new backend
     local pid="${PROXY_PID}"
     [[ -z "$pid" ]] && pid="$(cat "$PROXY_PID_FILE" 2>/dev/null || true)"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -522,54 +323,129 @@ reload_proxy() {
 }
 
 # ---------------------------------------------------------------------------
-# USB socat bridge  (UDP ↔ serial)
+# USB Bridge — knxd or socat
 # ---------------------------------------------------------------------------
-start_usb_bridge() {
-    stop_bridge
-    local dev="$1" baud="$2" lport="$3"
-    log_info "Starting USB bridge: ${dev} @ ${baud}→ UDP:${lport}"
-    socat "UDP-LISTEN:${lport},fork,reuseaddr" \
-          "OPEN:${dev},raw,echo=0,b${baud},crtscts=0" &
-    SOCAT_PID="$!"; echo "$SOCAT_PID" > "$SOCAT_PID_FILE"
-    sleep 1
-    if ! kill -0 "$SOCAT_PID" 2>/dev/null; then
-        log_error "USB bridge died immediately"
-        SOCAT_PID=""; rm -f "$SOCAT_PID_FILE"; return 1
+start_usb_knxd() {
+    stop_usb_bridge
+    local dev="$1" lport="$2"
+    log_info "Starting knxd USB bridge: ${dev} → KNXnet/IP on port ${lport}"
+
+    local knxd_args="-e 1.1.254 -E 1.1.255:8 -D -T -S"
+    [[ -n "$USB_KNXD_EXTRA" ]] && knxd_args="$knxd_args $USB_KNXD_EXTRA"
+
+    # knxd will expose the USB interface as a local KNXnet/IP tunnel
+    knxd $knxd_args --listen-tcp="0.0.0.0:${lport}" "usb:${dev}" &
+    KNXD_PID="$!"
+    echo "$KNXD_PID" > "$KNXD_PID_FILE"
+    sleep 2
+    if ! kill -0 "$KNXD_PID" 2>/dev/null; then
+        log_error "knxd died immediately"
+        KNXD_PID=""; rm -f "$KNXD_PID_FILE"; return 1
     fi
-    log_info "USB bridge up (pid=${SOCAT_PID})"; return 0
+    log_info "knxd USB bridge up (pid=${KNXD_PID})"; return 0
 }
 
-stop_bridge() {
-    local pid="${SOCAT_PID}"
+start_usb_socat() {
+    stop_usb_bridge
+    local dev="$1" baud="$2" lport="$3"
+    log_info "Starting socat USB bridge: ${dev} @ ${baud} → UDP:${lport}"
+    socat "UDP-LISTEN:${lport},fork,reuseaddr" \
+          "OPEN:${dev},raw,echo=0,b${baud},crtscts=0" &
+    SOCAT_PID="$!"
+    echo "$SOCAT_PID" > "$SOCAT_PID_FILE"
+    sleep 1
+    if ! kill -0 "$SOCAT_PID" 2>/dev/null; then
+        log_error "socat USB bridge died immediately"
+        SOCAT_PID=""; rm -f "$SOCAT_PID_FILE"; return 1
+    fi
+    log_info "socat USB bridge up (pid=${SOCAT_PID})"; return 0
+}
+
+start_usb_bridge() {
+    local dev="$1"
+    if [[ "$HAS_KNXD" == "true" ]]; then
+        start_usb_knxd "$dev" "$USB_LOCAL_PORT"
+    else
+        start_usb_socat "$dev" "$USB_BAUD" "$USB_LOCAL_PORT"
+    fi
+}
+
+stop_usb_bridge() {
+    # Stop knxd
+    local pid="${KNXD_PID}"
+    [[ -z "$pid" ]] && pid="$(cat "$KNXD_PID_FILE" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && {
+        kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+    rm -f "$KNXD_PID_FILE"; KNXD_PID=""
+
+    # Stop socat
+    pid="${SOCAT_PID}"
     [[ -z "$pid" ]] && pid="$(cat "$SOCAT_PID_FILE" 2>/dev/null || true)"
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && {
         kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
-    rm -f "$SOCAT_PID_FILE"; SOCAT_PID=""; return 0
+    rm -f "$SOCAT_PID_FILE"; SOCAT_PID=""
+
+    return 0
+}
+
+is_usb_bridge_alive() {
+    # Check if knxd or socat is alive
+    if [[ -n "$KNXD_PID" ]] && kill -0 "$KNXD_PID" 2>/dev/null; then return 0; fi
+    if [[ -n "$SOCAT_PID" ]] && kill -0 "$SOCAT_PID" 2>/dev/null; then return 0; fi
+    return 1
 }
 
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 write_state() {
-    { echo "state=${CURRENT_STATE}"
-      echo "timestamp=$(date -Iseconds 2>/dev/null || date)"
-      echo "version=${VERSION}"
+    {
+        echo "state=${CURRENT_STATE}"
+        echo "primary_host=${PRIMARY_HOST}"
+        echo "primary_port=${PRIMARY_PORT}"
+        echo "backup_host=${BACKUP_HOST}"
+        echo "backup_port=${BACKUP_PORT}"
+        echo "failback_mode=${FAILBACK_MODE}"
+        echo "timestamp=$(date -Iseconds 2>/dev/null || date)"
+        echo "version=${VERSION}"
     } > "$STATE_FILE" 2>/dev/null || true; return 0
 }
 
+set_failback_holdoff() {
+    local reason="${1:-failover}"
+    local now
+    now="$(date +%s)"
+    PRIMARY_HOLD_UNTIL=$(( now + FAILBACK_DELAY ))
+    log_info "Failback delayed for ${FAILBACK_DELAY}s (${reason})"
+}
+
+is_failback_holdoff_active() {
+    local now; now="$(date +%s)"
+    [[ "$now" -lt "$PRIMARY_HOLD_UNTIL" ]]
+}
+
+failback_remaining() {
+    local now remain
+    now="$(date +%s)"
+    remain=$(( PRIMARY_HOLD_UNTIL - now ))
+    [[ "$remain" -lt 0 ]] && remain=0
+    echo "$remain"
+}
+
+# ---------------------------------------------------------------------------
+# State transitions
+# ---------------------------------------------------------------------------
 enter_primary() {
     local proto="$1"
     log_notice "→ PRIMARY (${PRIMARY_HOST}:${PRIMARY_PORT} [${proto}])"
     CURRENT_STATE="$STATE_PRIMARY"
     PRIMARY_FAIL_COUNT=0; PRIMARY_RISE_COUNT=0; BACKUP_FAIL_COUNT=0
-    PRIMARY_CONNECT_REJECT_COUNT=0
-    PRIMARY_TCP_RETRY_DONE=0
     PRIMARY_HOLD_UNTIL=0
-    stop_bridge
+    stop_usb_bridge
     set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "$proto"
     reload_proxy
     write_state
-    ha_notify "Primary restored" "Routing through ${PRIMARY_HOST}:${PRIMARY_PORT} [${proto}]"
+    ha_notify "Primary active" "Routing through ${PRIMARY_HOST}:${PRIMARY_PORT} [${proto}]"
     return 0
 }
 
@@ -577,39 +453,44 @@ enter_backup() {
     local proto="$1"
     log_notice "→ BACKUP (${BACKUP_HOST}:${BACKUP_PORT} [${proto}])"
     CURRENT_STATE="$STATE_BACKUP"; BACKUP_FAIL_COUNT=0
-    BACKUP_CONNECT_REJECT_COUNT=0
-    stop_bridge
+    stop_usb_bridge
     set_backend "$BACKUP_HOST" "$BACKUP_PORT" "$proto"
     reload_proxy
     write_state
     ha_notify "Failover to backup" "Primary down. Using ${BACKUP_HOST}:${BACKUP_PORT} [${proto}]."
+
+    # Set failback holdoff when entering backup
+    if [[ "$FAILBACK_MODE" == "auto" ]]; then
+        set_failback_holdoff "failover-to-backup"
+    fi
     return 0
 }
 
 enter_backup_fast() {
-    # Runtime emergency path: if active backend hard-rejects CONNECT,
-    # move traffic to backup immediately and let live traffic validate it.
     local proto
     proto="$(select_backend_proto udp "$BACKUP_PROTOCOL")"
     log_notice "→ BACKUP-FAST (${BACKUP_HOST}:${BACKUP_PORT} [${proto}])"
     CURRENT_STATE="$STATE_BACKUP"
-    BACKUP_FAIL_COUNT=0
-    PRIMARY_RISE_COUNT=0
-    BACKUP_CONNECT_REJECT_COUNT=0
-    stop_bridge
+    BACKUP_FAIL_COUNT=0; PRIMARY_RISE_COUNT=0
+    stop_usb_bridge
     set_backend "$BACKUP_HOST" "$BACKUP_PORT" "$proto"
     reload_proxy
     write_state
-    ha_notify "Failover to backup" "Primary tunnel reject. Using ${BACKUP_HOST}:${BACKUP_PORT} [${proto}] (fast)."
+    ha_notify "Fast failover" "Primary rejected. Using ${BACKUP_HOST}:${BACKUP_PORT} [${proto}]."
+
+    if [[ "$FAILBACK_MODE" == "auto" ]]; then
+        set_failback_holdoff "fast-failover"
+    fi
     return 0
 }
 
 enter_usb() {
-    log_notice "→ USB (${USB_DEVICE}, ${USB_BAUD} baud)"
+    log_notice "→ USB (${USB_DEVICE})"
     CURRENT_STATE="$STATE_USB"
-    stop_bridge
-    if start_usb_bridge "$USB_DEVICE" "$USB_BAUD" "$UDP_BRIDGE_PORT"; then
-        set_backend "127.0.0.1" "$UDP_BRIDGE_PORT" "udp"
+    if start_usb_bridge "$USB_DEVICE"; then
+        local usb_proto="tcp"
+        [[ "$HAS_KNXD" != "true" ]] && usb_proto="udp"
+        set_backend "127.0.0.1" "$USB_LOCAL_PORT" "$usb_proto"
         reload_proxy
         write_state
         ha_notify "Failover to USB" "Both IP interfaces down. Using USB ${USB_DEVICE}."
@@ -635,9 +516,11 @@ enter_degraded() {
 initial_probe() {
     log_info "Running startup probes..."
 
+    # USB preferred?
     if [[ "$USB_PRIORITY" == "prefer" ]] && [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
         log_info "USB preferred and present"; enter_usb; return; fi
 
+    # Try primary
     local proto
     proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
@@ -645,15 +528,18 @@ initial_probe() {
         log_info "Primary: OK [${proto}]"; enter_primary "$proto"; return; fi
     log_warn "Primary probe failed (${PRIMARY_HOST}:${PRIMARY_PORT})"
 
+    # Try backup
     proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$proto" != "none" ]]; then
         proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
         log_info "Backup: OK [${proto}]"; enter_backup "$proto"; return; fi
     log_warn "Backup probe failed (${BACKUP_HOST}:${BACKUP_PORT})"
 
+    # Try USB as last resort
     if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
         log_info "USB available as last resort"; enter_usb; return; fi
 
+    # Everything down
     log_error "No interface reachable — entering DEGRADED retry loop"
     enter_degraded "startup-all-probes-failed"
 }
@@ -674,58 +560,33 @@ monitor_tick() {
 }
 
 tick_primary() {
+    # Check for runtime tunnel rejection
     local rej_status
     rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
-        local active_proto
-        active_proto="$(current_backend_proto)"
-        if [[ "$active_proto" == "udp" && "$PRIMARY_TCP_RETRY_DONE" -eq 0 ]]; then
-            log_warn "Primary tunnel hard-reject detected (${rej_status}) on UDP — retrying same primary over TCP"
-            PRIMARY_TCP_RETRY_DONE=1
-            PRIMARY_CONNECT_REJECT_COUNT=0
-            set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "tcp"
-            reload_proxy
-            write_state
-            return 0
-        fi
-
-        log_warn "Primary tunnel hard-reject detected (${rej_status}) — failing over now"
-        set_primary_holdoff "hard-reject-${rej_status}"
+        log_warn "Primary tunnel hard-reject (${rej_status}) — failing over"
         enter_backup_fast
         return 0
     fi
 
+    # Probe primary health
     local proto
     proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
-        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+        # Check for soft rejects
         rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
         if [[ -n "$rej_status" ]]; then
-            PRIMARY_CONNECT_REJECT_COUNT=$((PRIMARY_CONNECT_REJECT_COUNT + 1))
-            log_warn "Primary tunnel rejected recently (${rej_status}) (${PRIMARY_CONNECT_REJECT_COUNT}/2)"
-            if [[ "$PRIMARY_CONNECT_REJECT_COUNT" -ge 2 ]]; then
-                local active_proto
-                active_proto="$(current_backend_proto)"
-                if [[ "$active_proto" == "udp" && "$PRIMARY_TCP_RETRY_DONE" -eq 0 ]]; then
-                    log_warn "Primary reachable but not tunnel-usable on UDP — retrying same primary over TCP"
-                    PRIMARY_TCP_RETRY_DONE=1
-                    PRIMARY_CONNECT_REJECT_COUNT=0
-                    set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "tcp"
-                    reload_proxy
-                    write_state
-                    return 0
-                fi
-
-                log_warn "Primary reachable but not tunnel-usable — failing over"
-                set_primary_holdoff "repeated-reject-${rej_status}"
+            PRIMARY_FAIL_COUNT=$((PRIMARY_FAIL_COUNT + 1))
+            log_warn "Primary tunnel rejected (${rej_status}) (${PRIMARY_FAIL_COUNT}/${CHECK_FALL})"
+            if [[ "$PRIMARY_FAIL_COUNT" -ge "$CHECK_FALL" ]]; then
+                log_warn "Primary repeatedly rejected — failing over"
                 enter_backup_fast
-                return 0
             fi
-        else
-            PRIMARY_CONNECT_REJECT_COUNT=0
+            return 0
         fi
+        log_debug "Primary: OK [${proto}]"; PRIMARY_FAIL_COUNT=0; return 0
+    fi
 
-        log_debug "Primary: OK [${proto}]"; PRIMARY_FAIL_COUNT=0; return 0; fi
     PRIMARY_FAIL_COUNT=$((PRIMARY_FAIL_COUNT + 1))
     log_warn "Primary probe failed (${PRIMARY_FAIL_COUNT}/${CHECK_FALL})"
     if [[ "$PRIMARY_FAIL_COUNT" -ge "$CHECK_FALL" ]]; then
@@ -734,65 +595,85 @@ tick_primary() {
         if [[ "$bproto" != "none" ]]; then
             bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
             enter_backup "$bproto"
-        elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
-        else enter_degraded "primary-failed-no-backup"; fi
+        elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
+            enter_usb
+        else
+            enter_degraded "primary-failed-no-backup"
+        fi
     fi; return 0
 }
 
 tick_backup() {
+    # Check backup health (via reject file only — avoid probing active backend)
     local rej_status
     rej_status="$(read_backend_reject_status "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
-        log_warn "Backup tunnel hard-reject detected (${rej_status})"
-        if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
-        else enter_degraded "backup-hard-reject"; fi
+        log_warn "Backup tunnel hard-reject (${rej_status})"
+        if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
+            enter_usb
+        else
+            enter_degraded "backup-hard-reject"
+        fi
         return 0
     fi
 
-    if is_primary_holdoff_active; then
-        local remain
-        remain="$(primary_holdoff_remaining)"
-        log_debug "Primary recovery holdoff active (${remain}s remaining)"
-        PRIMARY_RISE_COUNT=0
-    else
-        local proto
-        proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
-        if [[ "$proto" != "none" ]]; then
-            proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
-            PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
-            log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
-            if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
-                log_notice "Primary recovered"; enter_primary "$proto"; return 0; fi
-        else
-            [[ "$PRIMARY_RISE_COUNT" -gt 0 ]] && log_debug "Primary recovery reset"
-            PRIMARY_RISE_COUNT=0
-        fi
-    fi
-    # Do not actively probe backup while we are already routing through it.
-    # Probe traffic itself can be noisy/expensive on some KNX gateways and
-    # may interfere with limited tunnel slot resources.
-    # We stay in BACKUP unless live tunnel rejects indicate it is unusable.
-    BACKUP_FAIL_COUNT=0
-    log_debug "Backup active — skipping background backup probes"
+    # Failback logic
+    case "$FAILBACK_MODE" in
+        disabled)
+            log_debug "Failback disabled — staying on backup"
+            return 0
+            ;;
+        manual)
+            log_debug "Failback manual — staying on backup (restart to failback)"
+            return 0
+            ;;
+        auto)
+            if is_failback_holdoff_active; then
+                local remain; remain="$(failback_remaining)"
+                log_debug "Failback holdoff active (${remain}s remaining)"
+                PRIMARY_RISE_COUNT=0
+                return 0
+            fi
+
+            local proto
+            proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+            if [[ "$proto" != "none" ]]; then
+                proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+                PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
+                log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
+                if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
+                    log_notice "Primary recovered — failing back"
+                    enter_primary "$proto"
+                fi
+            else
+                [[ "$PRIMARY_RISE_COUNT" -gt 0 ]] && log_debug "Primary recovery reset"
+                PRIMARY_RISE_COUNT=0
+            fi
+            ;;
+    esac
     return 0
 }
 
 tick_usb() {
-    local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+    # Try to recover to IP interfaces
+    local proto
+    proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$proto" != "none" ]]; then
         proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
         log_notice "Primary recovered (from USB)"; enter_primary "$proto"; return 0; fi
+
     proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$proto" != "none" ]]; then
         proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
         log_notice "Backup recovered (from USB)"; enter_backup "$proto"; return 0; fi
-    if [[ -n "$SOCAT_PID" ]] && ! kill -0 "$SOCAT_PID" 2>/dev/null; then
+
+    # Check USB bridge is still alive
+    if ! is_usb_bridge_alive; then
         if ! usb_probe "$USB_DEVICE"; then
             log_error "USB device gone"; enter_degraded "usb-device-gone"
         else
             log_warn "USB bridge died; restarting"
-            start_usb_bridge "$USB_DEVICE" "$USB_BAUD" "$UDP_BRIDGE_PORT" || \
-                enter_degraded "usb-bridge-restart-failed"
+            start_usb_bridge "$USB_DEVICE" || enter_degraded "usb-bridge-restart-failed"
         fi; return 0
     fi
     log_debug "USB: OK"; return 0
@@ -800,22 +681,25 @@ tick_usb() {
 
 tick_degraded() {
     log_debug "DEGRADED: retrying all interfaces..."
-    if is_primary_holdoff_active; then
-        local remain
-        remain="$(primary_holdoff_remaining)"
-        log_debug "Primary recovery holdoff active in DEGRADED (${remain}s remaining)"
-    else
+
+    # Try primary (unless in holdoff)
+    if ! is_failback_holdoff_active; then
         local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
         if [[ "$proto" != "none" ]]; then
             proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
             log_notice "Primary back [${proto}]"; enter_primary "$proto"; return 0; fi
     fi
-    proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+
+    # Try backup
+    local proto; proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$proto" != "none" ]]; then
         proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
         log_notice "Backup back [${proto}]"; enter_backup "$proto"; return 0; fi
+
+    # Try USB
     if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
         log_notice "USB available"; enter_usb; return 0; fi
+
     log_debug "All interfaces still down — retrying in ${CHECK_INTERVAL}s"; return 0
 }
 
@@ -824,9 +708,10 @@ tick_degraded() {
 # ---------------------------------------------------------------------------
 cleanup() {
     log_info "Shutting down..."
-    stop_proxy  || true
-    stop_bridge || true
-    rm -f "$STATE_FILE" "$BACKEND_FILE" "$BACKEND_REJECT_FILE" 2>/dev/null || true
+    stop_proxy    || true
+    stop_usb_bridge || true
+    rm -f "$STATE_FILE" "$BACKEND_FILE" "$BACKEND_REJECT_FILE" \
+          "$METRICS_FILE" 2>/dev/null || true
     log_info "Done"
 }
 trap cleanup INT TERM EXIT
@@ -838,21 +723,18 @@ main() {
     log_info "===== KNX Failover Proxy v${VERSION} ====="
     require_cmd jq
     require_cmd python3
-    require_cmd socat
-    require_cmd timeout
 
     load_config
 
-    log_info "Primary:  ${PRIMARY_HOST}:${PRIMARY_PORT}"
-    log_info "Backup:   ${BACKUP_HOST}:${BACKUP_PORT}"
-    log_info "Backend protocol pin: primary=${PRIMARY_PROTOCOL} backup=${BACKUP_PROTOCOL}"
-    log_info "Frontend: ${FRONTEND_PROTOCOL}"
-    log_info "Listen:   0.0.0.0:${LISTEN_PORT} (frontend=${FRONTEND_PROTOCOL})"
+    log_info "Primary:   ${PRIMARY_HOST}:${PRIMARY_PORT} [${PRIMARY_PROTOCOL}]${PRIMARY_SECURE:+ (secure=${PRIMARY_SECURE})}"
+    log_info "Backup:    ${BACKUP_HOST}:${BACKUP_PORT} [${BACKUP_PROTOCOL}]${BACKUP_SECURE:+ (secure=${BACKUP_SECURE})}"
+    log_info "Frontend:  ${FRONTEND_PROTOCOL} on port ${LISTEN_PORT}"
     [[ -n "$USB_DEVICE" ]] && \
-        log_info "USB:      ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY})"
-    log_info "Health:   interval=${CHECK_INTERVAL}s fall=${CHECK_FALL} rise=${CHECK_RISE}"
-    log_info "Recovery: primary_holdoff=${PRIMARY_RECOVERY_HOLD_SECS}s"
-    log_info "Probe:    prefer_protocol=${PREFER_PROTOCOL} timeout=${CONNECTION_TIMEOUT}s"
+        log_info "USB:       ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY}, knxd=${HAS_KNXD})"
+    log_info "Health:    interval=${CHECK_INTERVAL}s fall=${CHECK_FALL} rise=${CHECK_RISE} method=${CHECK_METHOD}"
+    log_info "Failback:  mode=${FAILBACK_MODE} delay=${FAILBACK_DELAY}s"
+    log_info "Sessions:  max=${MAX_SESSIONS} timeout=${SESSION_TIMEOUT}s drain=${DRAIN_TIMEOUT}s"
+    log_info "Timeout:   ${CONNECTION_TIMEOUT}s"
 
     clear_backend
     start_proxy || die "Cannot start KNX proxy"

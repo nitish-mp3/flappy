@@ -1,7 +1,7 @@
-name: KNX HAProxy Addon Repository
+name: KNX Failover Proxy Add-on Repository
 url: https://github.com/nitish-mp3/flappy
 maintainer: Niti
 codeowners:
   - nitish-p3
 documentation: https://github.com/nitish-mp3/flappy
-issues: https://github.com/nitish-mp3/flappy
+issues: https://github.com/nitish-mp3/flappy/issues
