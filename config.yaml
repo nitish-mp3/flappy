@@ -5,7 +5,7 @@ description: >
   KNX/IP failover proxy with instant hot-failover,
   KNX IP Secure tunneling, USB via knxd, and configurable failback.
   Supports TCP, UDP, and USB interfaces in any combination.
-version: "3.1.4"
+version: "3.2.0"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -72,8 +72,8 @@ schema:
   listen_port: port
 
   # Primary
-  primary_host: str
-  primary_port: port
+  primary_host: str?
+  primary_port: port?
   primary_protocol: list(tcp|udp|auto)?
   primary_secure: bool?
   primary_device_password: password?

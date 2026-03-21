@@ -35,7 +35,8 @@ USB_DEVICE="$(read_opt usb_device)"
 PRIMARY_SECURE="$(read_opt primary_secure)"
 BACKUP_SECURE="$(read_opt backup_secure)"
 
-[[ -n "$PRIMARY_HOST" ]] || fail "primary_host is required"
+KNXD_HOST="$(read_opt knxd_host)"
+[[ -n "$PRIMARY_HOST" || -n "$BACKUP_HOST" || -n "$KNXD_HOST" || -n "$USB_DEVICE" ]] || fail "At least one backend config (primary, backup, knxd, or usb) must be provided"
 
 # ---------------------------------------------------------------------------
 # 4. Validate secure config consistency

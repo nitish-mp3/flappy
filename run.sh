@@ -146,9 +146,12 @@ load_config() {
     NOTIFY_ON_FAILOVER="$(read_option notify_on_failover false)"
 
     # Validation
-    [[ -n "$PRIMARY_HOST" ]] || die "primary_host is required"
-    is_valid_host "$PRIMARY_HOST" || die "primary_host invalid: $PRIMARY_HOST"
-    validate_port    "$PRIMARY_PORT"    primary_port
+    [[ -n "$PRIMARY_HOST" || -n "$BACKUP_HOST" || -n "$KNXD_HOST" || -n "$USB_DEVICE" ]] || die "At least one backend must be configured"
+    
+    if [[ -n "$PRIMARY_HOST" ]]; then
+        is_valid_host "$PRIMARY_HOST" || die "primary_host invalid: $PRIMARY_HOST"
+        validate_port    "$PRIMARY_PORT"    primary_port
+    fi
     if [[ -n "$BACKUP_HOST" ]]; then
         is_valid_host "$BACKUP_HOST"  || die "backup_host invalid: $BACKUP_HOST"
         validate_port    "$BACKUP_PORT"     backup_port
@@ -725,17 +728,22 @@ tick_backup() {
 
 tick_usb() {
     # Try to recover to IP interfaces
-    local proto
-    proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
-    if [[ "$proto" != "none" ]]; then
-        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
-        log_notice "Primary recovered (from USB)"; enter_primary "$proto"; return 0; fi
+    if [[ "$USB_PRIORITY" != "prefer" ]]; then
+        if [[ -n "$PRIMARY_HOST" ]]; then
+            local proto
+            proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+            if [[ "$proto" != "none" ]]; then
+                proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+                log_notice "Primary recovered (from USB)"; enter_primary "$proto"; return 0; fi
+        fi
 
-    if [[ -n "$BACKUP_HOST" ]]; then
-        proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-        if [[ "$proto" != "none" ]]; then
-            proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
-            log_notice "Backup recovered (from USB)"; enter_backup "$proto"; return 0; fi
+        if [[ -n "$BACKUP_HOST" ]]; then
+            local proto
+            proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+            if [[ "$proto" != "none" ]]; then
+                proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
+                log_notice "Backup recovered (from USB)"; enter_backup "$proto"; return 0; fi
+        fi
     fi
 
     # Check USB bridge is still alive
@@ -754,7 +762,7 @@ tick_degraded() {
     log_debug "DEGRADED: retrying all interfaces..."
 
     # Try primary (unless in holdoff)
-    if ! is_failback_holdoff_active; then
+    if ! is_failback_holdoff_active && [[ -n "$PRIMARY_HOST" ]]; then
         local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
         if [[ "$proto" != "none" ]]; then
             proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
@@ -808,19 +816,21 @@ tick_knxd() {
                 return 0
             fi
 
-            local proto
-            proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
-            if [[ "$proto" != "none" ]]; then
-                proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
-                PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
-                log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
-                if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
-                    log_notice "Primary recovered — failing back from knxd"
-                    enter_primary "$proto"
+            if [[ -n "$PRIMARY_HOST" ]]; then
+                local proto
+                proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+                if [[ "$proto" != "none" ]]; then
+                    proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+                    PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
+                    log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
+                    if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
+                        log_notice "Primary recovered — failing back from knxd"
+                        enter_primary "$proto"
+                    fi
+                    return 0
                 fi
-                return 0
+                PRIMARY_RISE_COUNT=0
             fi
-            PRIMARY_RISE_COUNT=0
 
             if [[ -n "$BACKUP_HOST" ]]; then
                 proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
