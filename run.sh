@@ -554,12 +554,14 @@ initial_probe() {
         log_info "USB preferred and present"; enter_usb; return; fi
 
     # Try primary
-    local proto
-    proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
-    if [[ "$proto" != "none" ]]; then
-        proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
-        log_info "Primary: OK [${proto}]"; enter_primary "$proto"; return; fi
-    log_warn "Primary probe failed (${PRIMARY_HOST}:${PRIMARY_PORT})"
+    if [[ -n "$PRIMARY_HOST" ]]; then
+        local proto
+        proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+        if [[ "$proto" != "none" ]]; then
+            proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+            log_info "Primary: OK [${proto}]"; enter_primary "$proto"; return; fi
+        log_warn "Primary probe failed (${PRIMARY_HOST}:${PRIMARY_PORT})"
+    fi
 
     # Try backup
     if [[ -n "$BACKUP_HOST" ]]; then
