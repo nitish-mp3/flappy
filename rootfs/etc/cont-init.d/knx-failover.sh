@@ -36,7 +36,6 @@ PRIMARY_SECURE="$(read_opt primary_secure)"
 BACKUP_SECURE="$(read_opt backup_secure)"
 
 [[ -n "$PRIMARY_HOST" ]] || fail "primary_host is required"
-[[ -n "$BACKUP_HOST"  ]] || fail "backup_host is required"
 
 # ---------------------------------------------------------------------------
 # 4. Validate secure config consistency

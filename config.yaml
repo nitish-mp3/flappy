@@ -5,10 +5,8 @@ description: >
   KNX/IP failover proxy with instant hot-failover,
   KNX IP Secure tunneling, USB via knxd, and configurable failback.
   Supports TCP, UDP, and USB interfaces in any combination.
-version: "3.1.1"
+version: "3.1.2"
 homeassistant: "2024.1.0"
-icon: flappy.png
-logo: flappy.png
 arch:
   - aarch64
   - amd64
@@ -34,13 +32,7 @@ options:
   primary_device_password: ""
   primary_user_password: ""
 
-  # Backup interface
-  backup_host: ""
-  backup_port: 3671
-  backup_protocol: udp
-  backup_secure: false
-  backup_device_password: ""
-  backup_user_password: ""
+
 
   # USB interface (local knxd)
   usb_device: ""
