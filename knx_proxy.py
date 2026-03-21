@@ -176,13 +176,45 @@ class KNXProxy:
     # ──────────────────────────────────────────────────────────────────
 
     def _on_sighup(self):
-        """Backend changed — drain all sessions gracefully."""
-        log.info("SIGHUP received — draining all sessions for backend switch")
+        """
+        Backend changed — hot re-route all sessions to the new backend.
+        Instead of draining (which disconnects HA and makes devices unavailable),
+        we open new backend connections and swap them in-place.
+        The client session is never interrupted.
+        """
+        log.info("SIGHUP received — hot re-routing sessions to new backend")
         self.sessions.record_failover()
-        udp_sock = self.udp.sock if self.udp else None
-        self.sessions.drain_all(udp_sock)
         clear_backend_reject()
-        log.info("Session drain complete — HA will reconnect to new backend")
+
+        new_backend = read_backend()
+        if new_backend is None:
+            log.warning("No backend configured — draining sessions as fallback")
+            udp_sock = self.udp.sock if self.udp else None
+            self.sessions.drain_all(udp_sock)
+            return
+
+        b_host, b_port, b_proto = new_backend
+        sessions = self.sessions.get_all()
+
+        if not sessions:
+            log.info("No active sessions — backend switch complete")
+            return
+
+        log.info(f"Re-routing {len(sessions)} sessions to {b_proto.upper()} {b_host}:{b_port}")
+
+        success = 0
+        failed = 0
+        for sess in sessions:
+            if not sess.alive or sess.draining:
+                continue
+            try:
+                self._hot_swap_backend(sess, b_host, b_port, b_proto)
+                success += 1
+            except Exception as e:
+                log.warning(f"Hot-swap failed for ch={sess.channel_id}: {e}")
+                failed += 1
+
+        log.info(f"Hot re-route complete: {success} re-routed, {failed} failed")
 
     def _on_stop(self):
         """Graceful shutdown."""
@@ -379,13 +411,61 @@ class KNXProxy:
                 sess.close()
                 return
 
-        # Session ended unexpectedly
+        # Backend connection lost — try hot-swap to new backend
         if sess.alive:
+            log.info(f"Session ch={sess.channel_id} backend connection lost — attempting hot-swap")
+            try:
+                backend = read_backend()
+                if backend:
+                    b_host, b_port, b_proto = backend
+                    # Only hot-swap if the backend is different or we can reconnect
+                    self._hot_swap_backend(sess, b_host, b_port, b_proto)
+                    # Restart relay loop with new backend
+                    log.info(f"Session ch={sess.channel_id} relay resumed after hot-swap")
+                    self._relay_from_backend(sess)
+                    return
+            except Exception as e:
+                log.warning(f"Hot-swap failed for ch={sess.channel_id}: {e}")
+
+            # Hot-swap failed — close the session
             self.sessions.remove(sess.channel_id)
             self._disconnect_backend(sess)
             log.info(f"Session ch={sess.channel_id} relay ended "
                      f"(uptime={sess.uptime():.0f}s, telegrams={sess.telegrams_fwd})")
             sess.close()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    def _hot_swap_backend(self, sess: Session,
+                          b_host: str, b_port: int, b_proto: str):
+        """
+        Open a new backend connection, negotiate a tunnel, and swap it
+        into an existing session. The client never disconnects.
+        """
+        # Disconnect old backend (best-effort)
+        try:
+            old_proto = PROTO_TCP if sess.backend_type == 'tcp' else PROTO_UDP
+            body = bytes([sess.channel_id, 0x00]) + make_hpai('0.0.0.0', 0, old_proto)
+            sess.send_to_backend(make_frame(DISCONNECT_REQ, body))
+        except Exception:
+            pass
+
+        # Open new backend socket
+        bsock = self.connector.open_socket(b_host, b_port, b_proto)
+
+        # Negotiate tunnel
+        ch_id, crd, status = self.connector.negotiate_tunnel(
+            bsock, b_host, b_port, b_proto
+        )
+
+        if ch_id is None:
+            bsock.close()
+            raise RuntimeError(f"Backend rejected CONNECT (status=0x{(status or 0):02x})")
+
+        # Swap the backend in-place
+        sess.swap_backend(bsock, b_proto, (b_host, b_port), ch_id)
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers

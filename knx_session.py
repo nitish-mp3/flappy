@@ -109,6 +109,29 @@ class Session:
                 except Exception:
                     pass
 
+    def swap_backend(self, new_sock: socket.socket,
+                     new_type: str, new_addr: tuple,
+                     new_channel_id: int):
+        """
+        Hot-swap the backend connection. The client session stays alive;
+        only the backend side is replaced.
+        Returns the old backend socket for cleanup.
+        """
+        old_sock = self.backend_sock
+        self.backend_sock = new_sock
+        self.backend_type = new_type
+        self.backend_addr = new_addr
+        self.channel_id = new_channel_id
+        self.last_seen = time.monotonic()
+        self.errors = 0
+        log.info(f"Session hot-swapped to {new_type.upper()} {new_addr[0]}:{new_addr[1]} ch={new_channel_id}")
+        # Close old backend socket (best effort)
+        if old_sock:
+            try:
+                old_sock.close()
+            except Exception:
+                pass
+
     def uptime(self) -> float:
         """Return session uptime in seconds."""
         return time.monotonic() - self.created_at

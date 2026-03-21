@@ -28,6 +28,7 @@ readonly STATE_BACKUP="BACKUP"
 readonly STATE_USB="USB"
 readonly STATE_DEGRADED="DEGRADED"
 readonly STATE_FAILBACK_PENDING="FAILBACK_PENDING"
+readonly STATE_KNXD="KNXD"
 
 # -- Config vars ---
 PRIMARY_HOST="" PRIMARY_PORT="" PRIMARY_PROTOCOL="" PRIMARY_SECURE=""
@@ -36,6 +37,7 @@ PRIMARY_DEVICE_PW="" PRIMARY_USER_PW=""
 BACKUP_DEVICE_PW="" BACKUP_USER_PW=""
 FRONTEND_PROTOCOL="" LISTEN_PORT=""
 USB_DEVICE="" USB_BAUD="" USB_PRIORITY="" USB_KNXD_EXTRA=""
+KNXD_HOST="" KNXD_PORT="" KNXD_PROTOCOL=""
 CHECK_INTERVAL="" CHECK_FALL="" CHECK_RISE="" CHECK_METHOD=""
 CONNECTION_TIMEOUT=""
 FAILBACK_MODE="" FAILBACK_DELAY=""
@@ -118,6 +120,11 @@ load_config() {
     USB_PRIORITY="$(read_option usb_priority last_resort)"
     USB_KNXD_EXTRA="$(read_option usb_knxd_extra_args '')"
 
+    # External knxd addon (third failover tier)
+    KNXD_HOST="$(read_option knxd_host '')"
+    KNXD_PORT="$(read_option knxd_port 3671)"
+    KNXD_PROTOCOL="$(read_option knxd_protocol udp)"
+
     # Health
     CHECK_INTERVAL="$(read_option health_check_interval 5)"
     CHECK_FALL="$(read_option health_check_fall 3)"
@@ -161,6 +168,11 @@ load_config() {
     [[ "$FRONTEND_PROTOCOL" =~ ^(udp|tcp|both)$ ]] || die "frontend_protocol invalid"
     [[ "$FAILBACK_MODE" =~ ^(auto|manual|disabled)$ ]] || die "failback_mode invalid"
     [[ "$CHECK_METHOD" =~ ^(probe|heartbeat|both)$ ]] || die "health_check_method invalid"
+    if [[ -n "$KNXD_HOST" ]]; then
+        is_valid_host "$KNXD_HOST" || die "knxd_host invalid: $KNXD_HOST"
+        validate_port "$KNXD_PORT" knxd_port
+        [[ "$KNXD_PROTOCOL" =~ ^(tcp|udp)$ ]] || die "knxd_protocol invalid"
+    fi
 
     # Deterministic fallback when both are auto
     if [[ "$PRIMARY_PROTOCOL" == "auto" && "$BACKUP_PROTOCOL" == "auto" ]]; then
@@ -510,6 +522,21 @@ enter_degraded() {
     return 0
 }
 
+enter_knxd() {
+    log_notice "→ KNXD (${KNXD_HOST}:${KNXD_PORT} [${KNXD_PROTOCOL}])"
+    CURRENT_STATE="$STATE_KNXD"
+    BACKUP_FAIL_COUNT=0
+    stop_usb_bridge
+    set_backend "$KNXD_HOST" "$KNXD_PORT" "$KNXD_PROTOCOL"
+    reload_proxy
+    write_state
+    ha_notify "Failover to knxd" "IP interfaces down. Using knxd at ${KNXD_HOST}:${KNXD_PORT} [${KNXD_PROTOCOL}]."
+    if [[ "$FAILBACK_MODE" == "auto" ]]; then
+        set_failback_holdoff "failover-to-knxd"
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Startup probe
 # ---------------------------------------------------------------------------
@@ -552,6 +579,7 @@ monitor_tick() {
         "$STATE_PRIMARY")  tick_primary  ;;
         "$STATE_BACKUP")   tick_backup   ;;
         "$STATE_USB")      tick_usb      ;;
+        "$STATE_KNXD")     tick_knxd     ;;
         "$STATE_DEGRADED") tick_degraded ;;
         *) log_warn "Unknown state '${CURRENT_STATE}'"; enter_degraded "unknown-state" ;;
     esac
@@ -595,6 +623,8 @@ tick_primary() {
         if [[ "$bproto" != "none" ]]; then
             bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
             enter_backup "$bproto"
+        elif [[ -n "$KNXD_HOST" ]]; then
+            enter_knxd
         elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
             enter_usb
         else
@@ -609,7 +639,9 @@ tick_backup() {
     rej_status="$(read_backend_reject_status "$BACKUP_HOST" "$BACKUP_PORT")"
     if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
         log_warn "Backup tunnel hard-reject (${rej_status})"
-        if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
+        if [[ -n "$KNXD_HOST" ]]; then
+            enter_knxd
+        elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
             enter_usb
         else
             enter_degraded "backup-hard-reject"
@@ -696,11 +728,68 @@ tick_degraded() {
         proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
         log_notice "Backup back [${proto}]"; enter_backup "$proto"; return 0; fi
 
+    # Try external knxd
+    if [[ -n "$KNXD_HOST" ]]; then
+        local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
+        if [[ "$kproto" != "none" ]]; then
+            log_notice "knxd available"; enter_knxd; return 0; fi
+    fi
+
     # Try USB
     if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
         log_notice "USB available"; enter_usb; return 0; fi
 
     log_debug "All interfaces still down — retrying in ${CHECK_INTERVAL}s"; return 0
+}
+
+tick_knxd() {
+    # Check knxd health via reject file
+    local rej_status
+    rej_status="$(read_backend_reject_status "$KNXD_HOST" "$KNXD_PORT")"
+    if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
+        log_warn "knxd tunnel hard-reject (${rej_status})"
+        if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
+            enter_usb
+        else
+            enter_degraded "knxd-hard-reject"
+        fi
+        return 0
+    fi
+
+    # Try to recover to primary or backup (failback)
+    case "$FAILBACK_MODE" in
+        disabled) return 0 ;;
+        manual)   return 0 ;;
+        auto)
+            if is_failback_holdoff_active; then
+                log_debug "Failback holdoff active from knxd state"
+                return 0
+            fi
+
+            local proto
+            proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+            if [[ "$proto" != "none" ]]; then
+                proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+                PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
+                log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
+                if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
+                    log_notice "Primary recovered — failing back from knxd"
+                    enter_primary "$proto"
+                fi
+                return 0
+            fi
+            PRIMARY_RISE_COUNT=0
+
+            proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+            if [[ "$proto" != "none" ]]; then
+                proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
+                log_notice "Backup recovered — moving from knxd to backup"
+                enter_backup "$proto"
+                return 0
+            fi
+            ;;
+    esac
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -728,6 +817,8 @@ main() {
 
     log_info "Primary:   ${PRIMARY_HOST}:${PRIMARY_PORT} [${PRIMARY_PROTOCOL}]${PRIMARY_SECURE:+ (secure=${PRIMARY_SECURE})}"
     log_info "Backup:    ${BACKUP_HOST}:${BACKUP_PORT} [${BACKUP_PROTOCOL}]${BACKUP_SECURE:+ (secure=${BACKUP_SECURE})}"
+    [[ -n "$KNXD_HOST" ]] && \
+        log_info "knxd Ext:  ${KNXD_HOST}:${KNXD_PORT} [${KNXD_PROTOCOL}]"
     log_info "Frontend:  ${FRONTEND_PROTOCOL} on port ${LISTEN_PORT}"
     [[ -n "$USB_DEVICE" ]] && \
         log_info "USB:       ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY}, knxd=${HAS_KNXD})"
