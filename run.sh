@@ -576,6 +576,7 @@ initial_probe() {
     if [[ -n "$KNXD_HOST" ]]; then
         proto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
         if [[ "$proto" != "none" ]]; then
+            proto="$(select_backend_proto "$proto" "$KNXD_PROTOCOL")"
             log_info "knxd: OK [${proto}]"; enter_knxd "$proto"; return; fi
         log_warn "knxd probe failed (${KNXD_HOST}:${KNXD_PORT})"
     fi
