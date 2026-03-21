@@ -624,7 +624,11 @@ tick_primary() {
             log_warn "Primary tunnel rejected (${rej_status}) (${PRIMARY_FAIL_COUNT}/${CHECK_FALL})"
             if [[ "$PRIMARY_FAIL_COUNT" -ge "$CHECK_FALL" ]]; then
                 log_warn "Primary repeatedly rejected — failing over"
-                enter_backup_fast
+                if [[ -n "$BACKUP_HOST" ]]; then enter_backup_fast
+                elif [[ -n "$KNXD_HOST" ]]; then enter_knxd
+                elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
+                else enter_degraded "primary-repeated-reject-no-backup"
+                fi
             fi
             return 0
         fi
@@ -635,11 +639,15 @@ tick_primary() {
     log_warn "Primary probe failed (${PRIMARY_FAIL_COUNT}/${CHECK_FALL})"
     if [[ "$PRIMARY_FAIL_COUNT" -ge "$CHECK_FALL" ]]; then
         log_warn "Primary failed — initiating failover"
-        local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-        if [[ "$bproto" != "none" ]]; then
-            bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
-            enter_backup "$bproto"
-        elif [[ -n "$KNXD_HOST" ]]; then
+        if [[ -n "$BACKUP_HOST" ]]; then
+            local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+            if [[ "$bproto" != "none" ]]; then
+                bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
+                enter_backup "$bproto"
+                return 0
+            fi
+        fi
+        if [[ -n "$KNXD_HOST" ]]; then
             enter_knxd
         elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
             enter_usb
