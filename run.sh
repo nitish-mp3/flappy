@@ -964,6 +964,26 @@ main() {
 
     clear_backend
 
+    # Clear ghost sessions from previous addon instances BEFORE probing.
+    # When the addon restarts, old tunnel sessions are still held by the
+    # gateway for 60-120s. This sends DISCONNECT for ch_id 1-8 to free them.
+    if [[ -n "$PRIMARY_HOST" ]]; then
+        log_info "Clearing ghost sessions on ${PRIMARY_HOST}:${PRIMARY_PORT} [${PRIMARY_PROTOCOL}]..."
+        python3 -c "
+import logging; logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+from knx_health import clear_ghost_sessions
+clear_ghost_sessions('${PRIMARY_HOST}', ${PRIMARY_PORT}, '${PRIMARY_PROTOCOL}')
+" 2>&1 | while read -r line; do log_debug "$line"; done || true
+        sleep 2  # Give gateway time to process
+    fi
+    if [[ -n "$BACKUP_HOST" ]]; then
+        python3 -c "
+import logging; logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+from knx_health import clear_ghost_sessions
+clear_ghost_sessions('${BACKUP_HOST}', ${BACKUP_PORT}, '${BACKUP_PROTOCOL}')
+" 2>&1 | while read -r line; do log_debug "$line"; done || true
+    fi
+
     # Probe all backends FIRST — find a working one before accepting clients.
     # Starting the proxy before a backend is ready causes a flood of
     # "CONNECT rejected — no backend configured" errors from HA.

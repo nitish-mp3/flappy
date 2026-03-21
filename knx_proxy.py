@@ -230,8 +230,21 @@ class KNXProxy:
         log.info(f"Hot re-route complete: {success} re-routed, {failed} failed")
 
     def _on_stop(self):
-        """Graceful shutdown."""
+        """Graceful shutdown — disconnect all backend sessions."""
+        log.info("Shutting down — disconnecting all sessions from backends")
         self.running = False
+
+        # Send DISCONNECT to every active backend so the gateway
+        # releases the tunnel slot immediately instead of holding it
+        # for the heartbeat timeout (60-120 seconds).
+        sessions = self.sessions.get_all()
+        for sess in sessions:
+            try:
+                self._disconnect_backend(sess)
+                sess.close()
+            except Exception:
+                pass
+        log.info(f"Shutdown complete — {len(sessions)} sessions disconnected")
 
     # ──────────────────────────────────────────────────────────────────
     # Backend connection

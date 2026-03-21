@@ -274,12 +274,20 @@ class BackendConnector:
 
             log.debug(f"Backend CONNECT rejected ({label}) status=0x{status:02x}")
 
-            # EARLY ABORT: if hardware says "no connections available" or
-            # "no more unique IDs", stop immediately. Trying more combos
-            # will only make it worse by keeping the TCP connection open longer.
-            if status in (0x22, 0x24, 0x25):
-                log.warning(f"Backend out of tunnel slots (0x{status:02x}) — aborting negotiation")
+            # EARLY ABORT on truly fatal errors only:
+            # 0x24 = no more unique IDs — hardware limitation, retrying is useless
+            # 0x25 = individual address in use — specific to requested address
+            if status in (0x24, 0x25):
+                log.warning(f"Backend fatal rejection (0x{status:02x}) — aborting negotiation")
                 return None, None, status
+
+            # For 0x22 (no more connections): DON'T abort early.
+            # Some gateways reject specific HPAI combos with 0x22 but accept others.
+            # Ghost sessions from previous addon restarts may also free up between retries.
+            # Use a longer delay to give the gateway time to recycle.
+            if status == 0x22 and i < len(attempts) - 1:
+                log.debug(f"Backend busy (0x22) — waiting 1s before next attempt")
+                _time.sleep(1.0)  # Extra delay on top of the 0.5s base delay
 
         log.warning(f"All CONNECT attempts failed (last_status=0x{(last_status if last_status is not None else 0):02x})")
         return None, None, last_status

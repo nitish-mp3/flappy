@@ -28,6 +28,65 @@ from knx_const import (
 log = logging.getLogger('knx_health')
 
 
+def clear_ghost_sessions(host: str, port: int, proto: str = 'tcp',
+                          timeout: int = 3) -> int:
+    """
+    Send DISCONNECT_REQUEST for channel IDs 1-8 to force-clear any
+    ghost tunnel sessions left on the gateway from previous addon instances.
+
+    This is necessary because:
+    1. When the addon restarts, old sessions are NOT properly disconnected
+       (SIGTERM/SIGKILL doesn't wait for clean DISCONNECT)
+    2. The gateway holds these ghost sessions for 60-120 seconds (heartbeat timeout)
+    3. During that time, ALL tunnel slots are occupied
+    4. Every CONNECT attempt gets 0x22 (no more connections)
+
+    Returns the number of DISCONNECT_REQ sent (not necessarily accepted).
+    """
+    cleared = 0
+    for ch_id in range(1, 9):
+        try:
+            hpai = make_hpai('0.0.0.0', 0,
+                             PROTO_TCP if proto == 'tcp' else PROTO_UDP)
+            body = bytes([ch_id, 0x00]) + hpai
+            frame = make_frame(DISCONNECT_REQ, body)
+
+            if proto == 'tcp':
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                try:
+                    s.connect((host, port))
+                    s.sendall(frame)
+                    # Try to read response (don't care about content)
+                    try:
+                        s.recv(64)
+                    except Exception:
+                        pass
+                    cleared += 1
+                finally:
+                    s.close()
+            else:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(timeout)
+                try:
+                    s.bind(('0.0.0.0', 0))
+                    s.sendto(frame, (host, port))
+                    try:
+                        s.recv(64)
+                    except Exception:
+                        pass
+                    cleared += 1
+                finally:
+                    s.close()
+        except Exception:
+            pass
+        time.sleep(0.1)  # Small delay between requests
+
+    log.info(f"Sent {cleared} DISCONNECT requests to {host}:{port} "
+             f"[{proto}] to clear ghost sessions")
+    return cleared
+
+
 class HealthResult:
     """Result of a health check."""
     __slots__ = ['ok', 'protocol', 'latency_ms', 'error', 'tunnel_ok', 'timestamp']
