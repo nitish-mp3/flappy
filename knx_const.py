@@ -10,7 +10,7 @@ import struct
 from typing import Optional, Tuple
 
 # ── Version ───────────────────────────────────────────────────────────
-VERSION = "3.0.0"
+VERSION = "4.1.0"
 
 # ── File Paths ────────────────────────────────────────────────────────
 BACKEND_FILE        = "/run/knx-active-backend"

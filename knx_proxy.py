@@ -150,6 +150,12 @@ class KNXProxy:
         # Backend connector
         self.connector = BackendConnector(connect_timeout=5.0)
 
+        # Per-backend cooldown: maps (host, port) -> earliest_retry_time
+        # Prevents hammering a backend that just rejected us
+        self._backend_cooldowns: dict = {}
+        self._cooldown_seconds = 10  # seconds to wait after a rejection
+        self._last_sighup_time: float = 0  # prevent rapid SIGHUP storms
+
         # Secure session manager
         self.secure_mgr = SecureSessionManager()
 
@@ -182,6 +188,13 @@ class KNXProxy:
         we open new backend connections and swap them in-place.
         The client session is never interrupted.
         """
+        # Cooldown: don't process SIGHUP if we just handled one
+        now = time.monotonic()
+        if now - self._last_sighup_time < 5.0:
+            log.debug("SIGHUP: ignored (cooldown — last swap was < 5s ago)")
+            return
+        self._last_sighup_time = now
+
         log.info("SIGHUP received — hot re-routing sessions to new backend")
         self.sessions.record_failover()
         clear_backend_reject()
@@ -264,6 +277,18 @@ class KNXProxy:
             return
 
         b_host, b_port, b_proto = backend
+
+        # Check cooldown — don't hammer a backend that just rejected us
+        cooldown_key = (b_host, b_port)
+        cooldown_until = self._backend_cooldowns.get(cooldown_key, 0)
+        now = time.monotonic()
+        if now < cooldown_until:
+            remaining = cooldown_until - now
+            log.info(f"CONNECT: backend {b_host}:{b_port} in cooldown "
+                     f"({remaining:.0f}s remaining) — rejecting client")
+            self._send_connect_error(client_type, client_ctrl, client_sock, E_NO_MORE_CONNS)
+            return
+
         log.info(f"CONNECT: {client_type.upper()} client {client_ctrl[0]}:{client_ctrl[1]}"
                  f" → {b_proto.upper()} backend {b_host}:{b_port}")
 
@@ -273,6 +298,7 @@ class KNXProxy:
         except Exception as e:
             log.error(f"Cannot reach backend {b_host}:{b_port} [{b_proto}]: {e}")
             report_backend_reject(b_host, b_port, b_proto, E_DATA_CONN)
+            self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
             self._send_connect_error(client_type, client_ctrl, client_sock, E_DATA_CONN)
             return
 
@@ -316,6 +342,7 @@ class KNXProxy:
             else:
                 bsock.close()
                 report_backend_reject(b_host, b_port, b_proto, final_status)
+                self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
                 self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
                 return
 
@@ -350,6 +377,8 @@ class KNXProxy:
                          daemon=True, name=f'relay-{ch_id}').start()
 
         clear_backend_reject()
+        # Clear cooldown for this backend since it accepted the connection
+        self._backend_cooldowns.pop(cooldown_key, None)
 
         # Send CONNECT_RESPONSE to client
         udp_sock = self.udp.sock if self.udp else None

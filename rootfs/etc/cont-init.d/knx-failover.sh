@@ -11,7 +11,7 @@ log()  { echo "[cont-init] $*"; }
 warn() { echo "[cont-init] WARN: $*"; }
 fail() { echo "[cont-init] FATAL: $*" >&2; exit 1; }
 
-log "KNX Failover Proxy v3.0.0 — pre-flight checks"
+log "KNX Failover Proxy v4.1.0 — pre-flight checks"
 
 # ---------------------------------------------------------------------------
 # 1. Verify options file exists and is valid JSON
@@ -52,10 +52,16 @@ if [[ "$BACKUP_SECURE" == "true" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. USB device presence check (advisory — device may hotplug later)
+# 5. USB device presence check + auto-discovery
 # ---------------------------------------------------------------------------
 if [[ -n "$USB_DEVICE" ]]; then
-    if [[ ! -e "$USB_DEVICE" ]]; then
+    if [[ "$USB_DEVICE" == "auto" ]]; then
+        log "USB device set to 'auto' — will discover at startup"
+        # Try to discover now for pre-flight info
+        if python3 /knx_usb.py --discover 2>/dev/null; then
+            :
+        fi
+    elif [[ ! -e "$USB_DEVICE" ]]; then
         warn "USB device not present at startup: $USB_DEVICE (will retry at runtime)"
     elif [[ ! -r "$USB_DEVICE" ]] || [[ ! -w "$USB_DEVICE" ]]; then
         warn "USB device exists but is not readable/writable: $USB_DEVICE"
@@ -72,14 +78,18 @@ mkdir -p /data
 mkdir -p /data/knx-secure
 
 # ---------------------------------------------------------------------------
-# 7. Check for knxd availability if USB is configured
+# 7. Check for knxd and pyusb availability
 # ---------------------------------------------------------------------------
-if [[ -n "$USB_DEVICE" ]]; then
-    if command -v knxd >/dev/null 2>&1; then
-        log "knxd available — USB will use knxd daemon"
-    else
-        warn "knxd not installed — USB will use socat serial bridge fallback"
-    fi
+if command -v knxd >/dev/null 2>&1; then
+    log "knxd available — USB can use knxd daemon"
+else
+    warn "knxd not installed"
+fi
+
+if python3 -c 'import usb.core' 2>/dev/null; then
+    log "pyusb available — USB can use native bridge"
+else
+    warn "pyusb not available — native USB bridge disabled"
 fi
 
 log "Pre-flight checks passed"

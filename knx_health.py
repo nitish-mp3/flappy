@@ -222,45 +222,48 @@ def _disconnect_tcp(sock: socket.socket, channel_id: int):
 def detect_protocol(host: str, port: int, prefer: str = 'tcp',
                     timeout: int = 5) -> str:
     """
-    Detect the supported TUNNELING protocol for a KNX endpoint.
+    Detect whether a KNX endpoint is alive and which protocol to use.
     Returns 'tcp', 'udp', or 'none'.
 
+    IMPORTANT: This function uses DESCRIPTION_REQUEST probes only.
+    It does NOT open tunnel connections (CONNECT), because each CONNECT
+    consumes one of the hardware's limited tunnel slots (typically 1-4).
+    Using CONNECT for health checks causes "tunnel slot starvation" where
+    health probes steal all available slots from real client sessions.
+
     Strategy:
-    1. Try tunnel probes (CONNECT + DISCONNECT) — this is the only
-       reliable way to confirm actual tunnel support.
-    2. If no tunnel works, try description probes to check if the
-       gateway is alive — return 'udp' as the safer default since
-       DESCRIPTION over TCP does NOT mean TCP tunneling is supported.
+    1. Try DESCRIPTION_REQUEST via the preferred protocol first.
+    2. Try the other protocol as fallback.
+    3. If the gateway responds to DESCRIPTION, it is alive — return
+       the preferred protocol (the user's configured choice).
     """
     log.debug(f"Detecting protocol for {host}:{port} (prefer={prefer})")
 
-    # Phase 1: Try actual tunnel probes
+    # Build probe order based on preference
     if prefer in ('tcp', 'auto'):
-        tunnel_order = [
-            ('tcp', probe_tunnel_tcp),
-            ('udp', probe_tunnel_udp),
+        probe_order = [
+            ('tcp', probe_description_tcp),
+            ('udp', probe_description_udp),
         ]
     else:
-        tunnel_order = [
-            ('udp', probe_tunnel_udp),
-            ('tcp', probe_tunnel_tcp),
+        probe_order = [
+            ('udp', probe_description_udp),
+            ('tcp', probe_description_tcp),
         ]
 
-    for proto, probe_fn in tunnel_order:
+    for proto, probe_fn in probe_order:
         result = probe_fn(host, port, timeout)
         if result.ok:
-            log.debug(f"  → {proto} tunnel OK ({result.latency_ms:.0f}ms)")
-            return proto
+            # Gateway is alive. Return the preferred protocol (user's choice)
+            # rather than the detected one, because DESCRIPTION support on TCP
+            # does not guarantee TCP tunneling support and vice versa.
+            # The user's config (prefer) is the authoritative source.
+            chosen = prefer if prefer in ('tcp', 'udp') else proto
+            log.debug(f"  → Gateway alive via {proto} description "
+                      f"({result.latency_ms:.0f}ms), using {chosen}")
+            return chosen
         else:
-            log.debug(f"  → {proto} tunnel failed: {result.error}")
-
-    # Phase 2: Tunnel probes failed. Try description to check if gateway
-    # is alive. If alive, return 'udp' (more widely supported for tunneling).
-    for probe_fn in [probe_description_udp, probe_description_tcp]:
-        result = probe_fn(host, port, timeout)
-        if result.ok:
-            log.debug(f"  → Gateway alive via description ({result.latency_ms:.0f}ms), defaulting to udp")
-            return 'udp'
+            log.debug(f"  → {proto} description failed: {result.error}")
 
     return 'none'
 

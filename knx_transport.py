@@ -176,90 +176,110 @@ class BackendConnector:
         Negotiate a KNX tunnel with the backend.
         Returns (channel_id, crd, status) or (None, None, status) on failure.
 
-        Tries multiple CRI/HPAI combinations for maximum compatibility
-        with different KNX gateway firmware.
+        Uses a minimal set of CRI/HPAI combinations to avoid exhausting
+        the hardware's limited tunnel slots. Aborts immediately on
+        0x22 (no more connections) or 0x24 (no more unique IDs) since
+        additional attempts would only make the situation worse.
         """
+        import time as _time
         from knx_const import (
             CONNECT_REQ, CONNECT_RESP, PROTO_TCP, PROTO_UDP,
-            CRI_TUNNEL_V1, CRI_TUNNEL_V2, CRI_TUNNEL_EX,
+            CRI_TUNNEL_V1, CRI_TUNNEL_V2,
             make_frame, make_hpai, parse_hpai, parse_frame, read_tcp_frame,
         )
 
         b_local_ip, b_local_port = bsock.getsockname()[:2]
-        b_hpai_proto = PROTO_TCP if proto == 'tcp' else PROTO_UDP
 
-        # Build CRI variants to try
-        cri_variants = []
-        if client_cri and client_cri not in [CRI_TUNNEL_V1, CRI_TUNNEL_V2]:
-            cri_variants.append((client_cri, 'client-cri'))
-        cri_variants.extend([
-            (CRI_TUNNEL_V1, 'tunnel-v1'),
-            (CRI_TUNNEL_V2, 'tunnel-v2'),
-            (CRI_TUNNEL_EX, 'tunnel-extended'),
-        ])
-
-        # Build HPAI variants to try
+        # Build a MINIMAL set of attempts — do not brute-force
+        # Most KNX hardware accepts the first standard combination.
+        attempts = []
         if proto == 'tcp':
-            hpai_variants = [
-                ('0.0.0.0', 0, PROTO_TCP, '0.0.0.0', 0, PROTO_TCP, 'tcp-zero'),
-                ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', 0, PROTO_UDP, 'mixed-zero'),
-                ('0.0.0.0', 0, PROTO_TCP, b_local_ip, b_local_port, PROTO_TCP, 'tcp-data-local'),
+            attempts = [
+                ('0.0.0.0', 0, PROTO_TCP, '0.0.0.0', 0, PROTO_TCP,
+                 CRI_TUNNEL_V1, 'tcp-zero+v1'),
+                ('0.0.0.0', 0, PROTO_TCP, '0.0.0.0', 0, PROTO_TCP,
+                 CRI_TUNNEL_V2, 'tcp-zero+v2'),
+                ('0.0.0.0', 0, PROTO_TCP, b_local_ip, b_local_port, PROTO_TCP,
+                 CRI_TUNNEL_V1, 'tcp-local+v1'),
             ]
         else:
-            hpai_variants = [
-                ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', 0, PROTO_UDP, 'udp-zero'),
-                ('0.0.0.0', 0, PROTO_UDP, b_local_ip, b_local_port, PROTO_UDP, 'udp-data-local'),
-                (b_local_ip, b_local_port, PROTO_UDP, b_local_ip, b_local_port, PROTO_UDP, 'udp-both-local'),
-                ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', b_local_port, PROTO_UDP, 'udp-data-port'),
+            attempts = [
+                ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', 0, PROTO_UDP,
+                 CRI_TUNNEL_V1, 'udp-zero+v1'),
+                ('0.0.0.0', 0, PROTO_UDP, '0.0.0.0', 0, PROTO_UDP,
+                 CRI_TUNNEL_V2, 'udp-zero+v2'),
+                ('0.0.0.0', 0, PROTO_UDP, b_local_ip, b_local_port, PROTO_UDP,
+                 CRI_TUNNEL_V1, 'udp-local+v1'),
+                (b_local_ip, b_local_port, PROTO_UDP, b_local_ip, b_local_port, PROTO_UDP,
+                 CRI_TUNNEL_V1, 'udp-both+v1'),
             ]
 
+        # If client sent a specific CRI, try it first
+        if client_cri and client_cri not in (CRI_TUNNEL_V1, CRI_TUNNEL_V2):
+            first = attempts[0]
+            attempts.insert(0, (
+                first[0], first[1], first[2], first[3], first[4], first[5],
+                client_cri, 'client-cri',
+            ))
+
         last_status = None
-        for ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port, data_proto, hpai_label in hpai_variants:
-            for cri, cri_label in cri_variants:
-                label = f"{hpai_label}+{cri_label}"
-                body = (
-                    make_hpai(ctrl_ip, ctrl_port, ctrl_proto)
-                    + make_hpai(data_ip, data_port, data_proto)
-                    + cri
-                )
-                req_frame = make_frame(CONNECT_REQ, body)
+        for i, (ctrl_ip, ctrl_port, ctrl_proto, data_ip, data_port,
+                data_proto, cri, label) in enumerate(attempts):
 
-                try:
-                    if proto == 'tcp':
-                        bsock.sendall(req_frame)
-                        svc, rbody = read_tcp_frame(bsock)
-                    else:
-                        bsock.send(req_frame)
-                        raw = bsock.recv(1024)
-                        svc, rbody = parse_frame(raw)
-                except socket.timeout:
-                    log.debug(f"CONNECT timeout ({label})")
-                    continue
-                except Exception as e:
-                    log.debug(f"CONNECT error ({label}): {e}")
-                    continue
+            # Small delay between retries to let hardware breathe
+            if i > 0:
+                _time.sleep(0.5)
 
-                if svc != CONNECT_RESP or not rbody or len(rbody) < 2:
-                    continue
+            body = (
+                make_hpai(ctrl_ip, ctrl_port, ctrl_proto)
+                + make_hpai(data_ip, data_port, data_proto)
+                + cri
+            )
+            req_frame = make_frame(CONNECT_REQ, body)
 
-                ch_id = rbody[0]
-                status = rbody[1]
-                last_status = status
+            try:
+                if proto == 'tcp':
+                    bsock.sendall(req_frame)
+                    svc, rbody = read_tcp_frame(bsock)
+                else:
+                    bsock.send(req_frame)
+                    raw = bsock.recv(1024)
+                    svc, rbody = parse_frame(raw)
+            except socket.timeout:
+                log.debug(f"CONNECT timeout ({label})")
+                continue
+            except Exception as e:
+                log.debug(f"CONNECT error ({label}): {e}")
+                continue
 
-                if status == 0x00:
-                    # Extract CRD
-                    crd = b'\x04\x04\x00\x00'
-                    if len(rbody) >= 10:
-                        _, _, _, r_off = parse_hpai(rbody, 2)
-                        if r_off < len(rbody):
-                            crd = rbody[r_off:]
-                    elif len(rbody) > 2:
-                        crd = rbody[2:]
+            if svc != CONNECT_RESP or not rbody or len(rbody) < 2:
+                continue
 
-                    log.info(f"Backend CONNECT accepted ({label}) ch={ch_id}")
-                    return ch_id, crd, 0x00
+            ch_id = rbody[0]
+            status = rbody[1]
+            last_status = status
 
-                log.debug(f"Backend CONNECT rejected ({label}) status=0x{status:02x}")
+            if status == 0x00:
+                # Extract CRD
+                crd = b'\x04\x04\x00\x00'
+                if len(rbody) >= 10:
+                    _, _, _, r_off = parse_hpai(rbody, 2)
+                    if r_off < len(rbody):
+                        crd = rbody[r_off:]
+                elif len(rbody) > 2:
+                    crd = rbody[2:]
+
+                log.info(f"Backend CONNECT accepted ({label}) ch={ch_id}")
+                return ch_id, crd, 0x00
+
+            log.debug(f"Backend CONNECT rejected ({label}) status=0x{status:02x}")
+
+            # EARLY ABORT: if hardware says "no connections available" or
+            # "no more unique IDs", stop immediately. Trying more combos
+            # will only make it worse by keeping the TCP connection open longer.
+            if status in (0x22, 0x24, 0x25):
+                log.warning(f"Backend out of tunnel slots (0x{status:02x}) — aborting negotiation")
+                return None, None, status
 
         log.warning(f"All CONNECT attempts failed (last_status=0x{(last_status if last_status is not None else 0):02x})")
         return None, None, last_status

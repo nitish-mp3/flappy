@@ -21,7 +21,7 @@ readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="3.0.0"
+readonly VERSION="4.1.0"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -36,7 +36,7 @@ BACKUP_HOST="" BACKUP_PORT="" BACKUP_PROTOCOL="" BACKUP_SECURE=""
 PRIMARY_DEVICE_PW="" PRIMARY_USER_PW=""
 BACKUP_DEVICE_PW="" BACKUP_USER_PW=""
 FRONTEND_PROTOCOL="" LISTEN_PORT=""
-USB_DEVICE="" USB_BAUD="" USB_PRIORITY="" USB_KNXD_EXTRA=""
+USB_DEVICE="" USB_BAUD="" USB_PRIORITY="" USB_MODE="" USB_KNXD_EXTRA=""
 KNXD_HOST="" KNXD_PORT="" KNXD_PROTOCOL=""
 CHECK_INTERVAL="" CHECK_FALL="" CHECK_RISE="" CHECK_METHOD=""
 CONNECTION_TIMEOUT=""
@@ -54,7 +54,10 @@ PRIMARY_RISE_COUNT=0
 BACKUP_FAIL_COUNT=0
 PRIMARY_HOLD_UNTIL=0
 HAS_KNXD=false
+HAS_PYUSB=false
 USB_LOCAL_PORT=13671
+NATIVE_USB_PID=""
+readonly NATIVE_USB_PID_FILE="/run/knx-usb-bridge.pid"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -119,6 +122,7 @@ load_config() {
     USB_BAUD="$(read_option usb_baud 19200)"
     USB_PRIORITY="$(read_option usb_priority last_resort)"
     USB_KNXD_EXTRA="$(read_option usb_knxd_extra_args '')"
+    USB_MODE="$(read_option usb_mode auto)"
 
     # External knxd addon (third failover tier)
     KNXD_HOST="$(read_option knxd_host '')"
@@ -172,6 +176,7 @@ load_config() {
     [[ "$FRONTEND_PROTOCOL" =~ ^(udp|tcp|both)$ ]] || die "frontend_protocol invalid"
     [[ "$FAILBACK_MODE" =~ ^(auto|manual|disabled)$ ]] || die "failback_mode invalid"
     [[ "$CHECK_METHOD" =~ ^(probe|heartbeat|both)$ ]] || die "health_check_method invalid"
+    [[ "$USB_MODE" =~ ^(auto|knxd|native|socat)$ ]] || die "usb_mode invalid"
     if [[ -n "$KNXD_HOST" ]]; then
         is_valid_host "$KNXD_HOST" || die "knxd_host invalid: $KNXD_HOST"
         validate_port "$KNXD_PORT" knxd_port
@@ -187,6 +192,24 @@ load_config() {
     # Check knxd availability
     if command -v knxd >/dev/null 2>&1; then
         HAS_KNXD=true
+    fi
+
+    # Check pyusb availability
+    if python3 -c 'import usb.core' 2>/dev/null; then
+        HAS_PYUSB=true
+    fi
+
+    # Auto-discover USB device if set to "auto" or empty
+    if [[ -n "$USB_DEVICE" ]] && [[ "$USB_DEVICE" == "auto" ]]; then
+        local discovered
+        discovered="$(python3 /knx_usb.py --discover 2>/dev/null | jq -r '.devices[0].path // ""' 2>/dev/null || true)"
+        if [[ -n "$discovered" ]]; then
+            USB_DEVICE="$discovered"
+            log_info "USB auto-discovered: ${USB_DEVICE}"
+        else
+            log_warn "USB auto-discovery found no KNX devices"
+            USB_DEVICE=""
+        fi
     fi
 }
 
@@ -334,6 +357,8 @@ reload_proxy() {
     [[ -z "$pid" ]] && pid="$(cat "$PROXY_PID_FILE" 2>/dev/null || true)"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
         kill -HUP "$pid" 2>/dev/null || true
+    else
+        log_debug "reload_proxy: proxy not running — skipping SIGHUP"
     fi
     return 0
 }
@@ -379,11 +404,54 @@ start_usb_socat() {
 
 start_usb_bridge() {
     local dev="$1"
-    if [[ "$HAS_KNXD" == "true" ]]; then
-        start_usb_knxd "$dev" "$USB_LOCAL_PORT"
-    else
-        start_usb_socat "$dev" "$USB_BAUD" "$USB_LOCAL_PORT"
+    # Select bridge mode based on usb_mode config
+    case "$USB_MODE" in
+        knxd)
+            if [[ "$HAS_KNXD" == "true" ]]; then
+                start_usb_knxd "$dev" "$USB_LOCAL_PORT"
+            else
+                log_warn "usb_mode=knxd but knxd not available — falling back to native"
+                start_usb_native "$dev" "$USB_LOCAL_PORT"
+            fi
+            ;;
+        native)
+            start_usb_native "$dev" "$USB_LOCAL_PORT"
+            ;;
+        socat)
+            start_usb_socat "$dev" "$USB_BAUD" "$USB_LOCAL_PORT"
+            ;;
+        auto|*)
+            if [[ "$HAS_KNXD" == "true" ]]; then
+                start_usb_knxd "$dev" "$USB_LOCAL_PORT"
+            elif [[ "$HAS_PYUSB" == "true" ]]; then
+                start_usb_native "$dev" "$USB_LOCAL_PORT"
+            else
+                start_usb_socat "$dev" "$USB_BAUD" "$USB_LOCAL_PORT"
+            fi
+            ;;
+    esac
+}
+
+start_usb_native() {
+    stop_usb_bridge
+    local dev="$1" lport="$2"
+    log_info "Starting native USB bridge: ${dev} → KNXnet/IP on port ${lport}"
+
+    if [[ "$HAS_PYUSB" != "true" ]]; then
+        log_error "pyusb not available — cannot start native USB bridge"
+        return 1
     fi
+
+    python3 /knx_usb.py --bridge "$dev" --port "$lport" &
+    NATIVE_USB_PID="$!"
+    echo "$NATIVE_USB_PID" > "$NATIVE_USB_PID_FILE"
+    sleep 3
+    if ! kill -0 "$NATIVE_USB_PID" 2>/dev/null; then
+        log_error "Native USB bridge died immediately"
+        NATIVE_USB_PID=""; rm -f "$NATIVE_USB_PID_FILE"; return 1
+    fi
+    log_info "Native USB bridge up (pid=${NATIVE_USB_PID})"
+    return 0
 }
 
 stop_usb_bridge() {
@@ -401,13 +469,21 @@ stop_usb_bridge() {
         kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
     rm -f "$SOCAT_PID_FILE"; SOCAT_PID=""
 
+    # Stop native USB bridge
+    pid="${NATIVE_USB_PID}"
+    [[ -z "$pid" ]] && pid="$(cat "$NATIVE_USB_PID_FILE" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && {
+        kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+    rm -f "$NATIVE_USB_PID_FILE"; NATIVE_USB_PID=""
+
     return 0
 }
 
 is_usb_bridge_alive() {
-    # Check if knxd or socat is alive
+    # Check if knxd, socat, or native bridge is alive
     if [[ -n "$KNXD_PID" ]] && kill -0 "$KNXD_PID" 2>/dev/null; then return 0; fi
     if [[ -n "$SOCAT_PID" ]] && kill -0 "$SOCAT_PID" 2>/dev/null; then return 0; fi
+    if [[ -n "$NATIVE_USB_PID" ]] && kill -0 "$NATIVE_USB_PID" 2>/dev/null; then return 0; fi
     return 1
 }
 
@@ -501,11 +577,11 @@ enter_backup_fast() {
 }
 
 enter_usb() {
-    log_notice "→ USB (${USB_DEVICE})"
+    log_notice "→ USB (${USB_DEVICE}) [mode=${USB_MODE}]"
     CURRENT_STATE="$STATE_USB"
     if start_usb_bridge "$USB_DEVICE"; then
         local usb_proto="tcp"
-        [[ "$HAS_KNXD" != "true" ]] && usb_proto="udp"
+        [[ "$HAS_KNXD" != "true" ]] && [[ "$USB_MODE" != "native" ]] && [[ "$HAS_PYUSB" != "true" ]] && usb_proto="udp"
         set_backend "127.0.0.1" "$USB_LOCAL_PORT" "$usb_proto"
         reload_proxy
         write_state
@@ -532,6 +608,7 @@ enter_knxd() {
     log_notice "→ KNXD (${KNXD_HOST}:${KNXD_PORT} [${proto}])"
     CURRENT_STATE="$STATE_KNXD"
     BACKUP_FAIL_COUNT=0
+    PRIMARY_RISE_COUNT=0
     stop_usb_bridge
     set_backend "$KNXD_HOST" "$KNXD_PORT" "$proto"
     reload_proxy
@@ -674,8 +751,8 @@ tick_backup() {
     # Check backup health (via reject file only — avoid probing active backend)
     local rej_status
     rej_status="$(read_backend_reject_status "$BACKUP_HOST" "$BACKUP_PORT")"
-    if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
-        log_warn "Backup tunnel hard-reject (${rej_status})"
+    if [[ "$rej_status" == "0x29" ]]; then
+        log_warn "Backup tunnel not supported (0x29)"
         if [[ -n "$KNXD_HOST" ]]; then
             local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
             if [[ "$kproto" != "none" ]]; then
@@ -687,7 +764,7 @@ tick_backup() {
         if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
             enter_usb
         else
-            enter_degraded "backup-hard-reject"
+            enter_degraded "backup-unsupported"
         fi
         return 0
     fi
@@ -879,16 +956,21 @@ main() {
         log_info "knxd Ext:  ${KNXD_HOST}:${KNXD_PORT} [${KNXD_PROTOCOL}]"
     log_info "Frontend:  ${FRONTEND_PROTOCOL} on port ${LISTEN_PORT}"
     [[ -n "$USB_DEVICE" ]] && \
-        log_info "USB:       ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY}, knxd=${HAS_KNXD})"
+        log_info "USB:       ${USB_DEVICE} @ ${USB_BAUD} baud (priority=${USB_PRIORITY}, mode=${USB_MODE}, knxd=${HAS_KNXD}, pyusb=${HAS_PYUSB})"
     log_info "Health:    interval=${CHECK_INTERVAL}s fall=${CHECK_FALL} rise=${CHECK_RISE} method=${CHECK_METHOD}"
     log_info "Failback:  mode=${FAILBACK_MODE} delay=${FAILBACK_DELAY}s"
     log_info "Sessions:  max=${MAX_SESSIONS} timeout=${SESSION_TIMEOUT}s drain=${DRAIN_TIMEOUT}s"
     log_info "Timeout:   ${CONNECTION_TIMEOUT}s"
 
     clear_backend
-    start_proxy || die "Cannot start KNX proxy"
 
+    # Probe all backends FIRST — find a working one before accepting clients.
+    # Starting the proxy before a backend is ready causes a flood of
+    # "CONNECT rejected — no backend configured" errors from HA.
     initial_probe
+
+    # NOW start the proxy — clients will connect to an already-configured backend
+    start_proxy || die "Cannot start KNX proxy"
 
     log_info "Entering monitor loop (interval=${CHECK_INTERVAL}s)..."
     while true; do

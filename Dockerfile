@@ -7,6 +7,8 @@ FROM $BUILD_FROM
 # jq          – JSON option parsing in bash
 # python3     – KNX proxy engine
 # py3-cryptography – ECDH / AES-128-CCM for KNX IP Secure
+# py3-pyusb   – native USB HID access for KNX USB interfaces
+# libusb      – USB library backend for pyusb
 # curl        – HA Supervisor API notifications
 # udev        – USB device auto-detection and permissions
 RUN apk add --no-cache \
@@ -17,7 +19,9 @@ RUN apk add --no-cache \
     curl \
     ca-certificates \
     udev \
-    && (apk add --no-cache knxd 2>/dev/null || echo "WARN: knxd not in repo — USB will use socat fallback")
+    libusb \
+    && (apk add --no-cache py3-pyusb 2>/dev/null || pip3 install --no-cache-dir pyusb 2>/dev/null || echo "WARN: pyusb not available — native USB will be disabled") \
+    && (apk add --no-cache knxd 2>/dev/null || echo "WARN: knxd not in repo — USB will use native or socat fallback")
 
 # ── Copy files ────────────────────────────────────────────────────────
 COPY rootfs /
@@ -30,6 +34,7 @@ COPY knx_transport.py /knx_transport.py
 COPY knx_session.py   /knx_session.py
 COPY knx_health.py    /knx_health.py
 COPY knx_const.py     /knx_const.py
+COPY knx_usb.py       /knx_usb.py
 
 RUN chmod 0755 \
         /run.sh \
@@ -40,6 +45,7 @@ RUN chmod 0755 \
         /knx_session.py \
         /knx_health.py \
         /knx_const.py \
+        /knx_usb.py \
         /etc/cont-init.d/knx-failover.sh \
         /etc/services.d/knx-failover/run \
         /etc/services.d/knx-failover/finish
