@@ -610,12 +610,12 @@ tick_primary() {
     # Check for runtime tunnel rejection
     local rej_status
     rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
-    if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
-        log_warn "Primary tunnel hard-reject (${rej_status}) — failing over"
+    if [[ "$rej_status" == "0x29" ]]; then
+        log_warn "Primary tunnel not supported (0x29) — failing over"
         if [[ -n "$BACKUP_HOST" ]]; then enter_backup_fast
         elif [[ -n "$KNXD_HOST" ]]; then enter_knxd
         elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
-        else enter_degraded "primary-hard-reject"
+        else enter_degraded "primary-unsupported"
         fi
         return 0
     fi
@@ -797,14 +797,15 @@ tick_degraded() {
 
 tick_knxd() {
     # Check knxd health via reject file
+    # Check for runtime tunnel rejection
     local rej_status
     rej_status="$(read_backend_reject_status "$KNXD_HOST" "$KNXD_PORT")"
-    if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
-        log_warn "knxd tunnel hard-reject (${rej_status})"
+    if [[ "$rej_status" == "0x29" ]]; then
+        log_warn "knxd tunnel not supported (0x29)"
         if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
             enter_usb
         else
-            enter_degraded "knxd-hard-reject"
+            enter_degraded "knxd-unsupported"
         fi
         return 0
     fi
