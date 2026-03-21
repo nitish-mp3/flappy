@@ -304,3 +304,27 @@ class BackendConnector:
         except Exception as e:
             log.warning(f"TCP fallback failed: {e}")
             return None, None, None, 0x26
+
+    def try_udp_fallback(self, host: str, port: int,
+                          client_cri: Optional[bytes] = None
+                          ) -> Tuple[Optional[socket.socket], Optional[int], Optional[bytes], Optional[int]]:
+        """
+        Emergency fallback: if TCP CONNECT is rejected with 0x22,
+        try UDP to the same host.
+
+        Many KNX gateways have separate TCP and UDP tunnel slot pools.
+        When TCP slots are exhausted, UDP slots may still be available.
+
+        Returns (socket, channel_id, crd, status) or (None, None, None, status).
+        """
+        log.info(f"Attempting UDP fallback for {host}:{port}")
+        try:
+            bsock = self.open_socket(host, port, 'udp')
+            ch_id, crd, status = self.negotiate_tunnel(bsock, host, port, 'udp', client_cri)
+            if ch_id is not None:
+                return bsock, ch_id, crd, status
+            bsock.close()
+            return None, None, None, status
+        except Exception as e:
+            log.warning(f"UDP fallback failed: {e}")
+            return None, None, None, 0x26

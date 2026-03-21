@@ -322,21 +322,48 @@ class KNXProxy:
         if ch_id is None:
             final_status = status if status else E_DATA_CONN
 
-            # Try TCP fallback if UDP was rejected with 0x22
-            if b_proto == 'udp' and final_status == 0x22:
-                log.info("UDP tunnel rejected (0x22) — trying TCP fallback")
-                bsock.close()
-                fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_tcp_fallback(
-                    b_host, b_port, client_cri
-                )
-                if fb_sock and fb_ch is not None:
-                    bsock = fb_sock
-                    ch_id = fb_ch
-                    crd = fb_crd
-                    b_proto = 'tcp'
-                    log.info(f"TCP fallback succeeded: ch={ch_id}")
+            # Try protocol fallback if rejected with 0x22 (no free slots)
+            # Many KNX gateways have separate TCP and UDP tunnel slot pools.
+            # When one protocol's slots are full, the other may still work.
+            if final_status == 0x22:
+                if b_proto == 'udp':
+                    log.info("UDP tunnel rejected (0x22) — trying TCP fallback")
+                    bsock.close()
+                    fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_tcp_fallback(
+                        b_host, b_port, client_cri
+                    )
+                    if fb_sock and fb_ch is not None:
+                        bsock = fb_sock
+                        ch_id = fb_ch
+                        crd = fb_crd
+                        b_proto = 'tcp'
+                        log.info(f"TCP fallback succeeded: ch={ch_id}")
+                    else:
+                        report_backend_reject(b_host, b_port, 'udp', final_status)
+                        self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
+                        self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
+                        return
+                elif b_proto == 'tcp':
+                    log.info("TCP tunnel rejected (0x22) — trying UDP fallback")
+                    bsock.close()
+                    fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_udp_fallback(
+                        b_host, b_port, client_cri
+                    )
+                    if fb_sock and fb_ch is not None:
+                        bsock = fb_sock
+                        ch_id = fb_ch
+                        crd = fb_crd
+                        b_proto = 'udp'
+                        log.info(f"UDP fallback succeeded: ch={ch_id}")
+                    else:
+                        report_backend_reject(b_host, b_port, 'tcp', final_status)
+                        self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
+                        self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
+                        return
                 else:
-                    report_backend_reject(b_host, b_port, 'udp', final_status)
+                    bsock.close()
+                    report_backend_reject(b_host, b_port, b_proto, final_status)
+                    self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
                     self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
                     return
             else:
@@ -492,6 +519,29 @@ class KNXProxy:
         ch_id, crd, status = self.connector.negotiate_tunnel(
             bsock, b_host, b_port, b_proto
         )
+
+        # Protocol fallback: if 0x22 on one protocol, try the other
+        if ch_id is None and status == 0x22:
+            bsock.close()
+            alt_proto = 'udp' if b_proto == 'tcp' else 'tcp'
+            log.info(f"Hot-swap: {b_proto.upper()} tunnel rejected (0x22) "
+                     f"— trying {alt_proto.upper()} fallback")
+            if alt_proto == 'udp':
+                fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_udp_fallback(
+                    b_host, b_port)
+            else:
+                fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_tcp_fallback(
+                    b_host, b_port)
+            if fb_sock and fb_ch is not None:
+                bsock = fb_sock
+                ch_id = fb_ch
+                crd = fb_crd
+                b_proto = alt_proto
+                log.info(f"Hot-swap: {alt_proto.upper()} fallback succeeded ch={ch_id}")
+            else:
+                raise RuntimeError(
+                    f"Backend rejected CONNECT on both protocols "
+                    f"(status=0x{(status or 0):02x})")
 
         if ch_id is None:
             bsock.close()
