@@ -161,17 +161,12 @@ class BackendConnector:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(self.connect_timeout)
             s.connect((host, port))
-            # After connect, use long timeout for relay — must survive
-            # xknx's 60-second heartbeat interval.
-            s.settimeout(65.0)
             return s
         else:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(self.connect_timeout)
             s.bind(('0.0.0.0', 0))
             s.connect((host, port))
-            # After connect, use long timeout for relay
-            s.settimeout(65.0)
             return s
 
     def negotiate_tunnel(self, bsock: socket.socket, host: str, port: int,

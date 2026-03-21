@@ -525,14 +525,15 @@ enter_degraded() {
 }
 
 enter_knxd() {
-    log_notice "→ KNXD (${KNXD_HOST}:${KNXD_PORT} [${KNXD_PROTOCOL}])"
+    local proto="${1:-$KNXD_PROTOCOL}"
+    log_notice "→ KNXD (${KNXD_HOST}:${KNXD_PORT} [${proto}])"
     CURRENT_STATE="$STATE_KNXD"
     BACKUP_FAIL_COUNT=0
     stop_usb_bridge
-    set_backend "$KNXD_HOST" "$KNXD_PORT" "$KNXD_PROTOCOL"
+    set_backend "$KNXD_HOST" "$KNXD_PORT" "$proto"
     reload_proxy
     write_state
-    ha_notify "Failover to knxd" "IP interfaces down. Using knxd at ${KNXD_HOST}:${KNXD_PORT} [${KNXD_PROTOCOL}]."
+    ha_notify "Failover to knxd" "IP interfaces down. Using knxd at ${KNXD_HOST}:${KNXD_PORT} [${proto}]."
     if [[ "$FAILBACK_MODE" == "auto" ]]; then
         set_failback_holdoff "failover-to-knxd"
     fi
@@ -570,7 +571,7 @@ initial_probe() {
     if [[ -n "$KNXD_HOST" ]]; then
         proto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
         if [[ "$proto" != "none" ]]; then
-            log_info "knxd: OK [${proto}]"; enter_knxd; return; fi
+            log_info "knxd: OK [${proto}]"; enter_knxd "$proto"; return; fi
         log_warn "knxd probe failed (${KNXD_HOST}:${KNXD_PORT})"
     fi
 
@@ -648,8 +649,14 @@ tick_primary() {
             fi
         fi
         if [[ -n "$KNXD_HOST" ]]; then
-            enter_knxd
-        elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
+            local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
+            if [[ "$kproto" != "none" ]]; then
+                kproto="$(select_backend_proto "$kproto" "$KNXD_PROTOCOL")"
+                enter_knxd "$kproto"
+                return 0
+            fi
+        fi
+        if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
             enter_usb
         else
             enter_degraded "primary-failed-no-backup"
@@ -664,8 +671,14 @@ tick_backup() {
     if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
         log_warn "Backup tunnel hard-reject (${rej_status})"
         if [[ -n "$KNXD_HOST" ]]; then
-            enter_knxd
-        elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
+            local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
+            if [[ "$kproto" != "none" ]]; then
+                kproto="$(select_backend_proto "$kproto" "$KNXD_PROTOCOL")"
+                enter_knxd "$kproto"
+                return 0
+            fi
+        fi
+        if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
             enter_usb
         else
             enter_degraded "backup-hard-reject"
@@ -760,7 +773,8 @@ tick_degraded() {
     if [[ -n "$KNXD_HOST" ]]; then
         local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
         if [[ "$kproto" != "none" ]]; then
-            log_notice "knxd available"; enter_knxd; return 0; fi
+            kproto="$(select_backend_proto "$kproto" "$KNXD_PROTOCOL")"
+            log_notice "knxd available"; enter_knxd "$kproto"; return 0; fi
     fi
 
     # Try USB

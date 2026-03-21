@@ -322,6 +322,10 @@ class KNXProxy:
         if crd is None:
             crd = CRD_DEFAULT
 
+        # Setup keep-alive timeout for the long-running socket relay
+        if bsock:
+            bsock.settimeout(65.0)
+
         # Build client-facing CONNECT_RESPONSE
         # For TCP: HPAI must be 0.0.0.0:0 (= "use this TCP connection for data")
         # For UDP: HPAI is 0.0.0.0:0 (= "use sender address")
@@ -463,6 +467,9 @@ class KNXProxy:
         if ch_id is None:
             bsock.close()
             raise RuntimeError(f"Backend rejected CONNECT (status=0x{(status or 0):02x})")
+
+        # Setup keep-alive timeout for the long-running socket relay
+        bsock.settimeout(65.0)
 
         # Swap the backend in-place
         sess.swap_backend(bsock, b_proto, (b_host, b_port), ch_id)
