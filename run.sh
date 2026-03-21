@@ -147,11 +147,12 @@ load_config() {
 
     # Validation
     [[ -n "$PRIMARY_HOST" ]] || die "primary_host is required"
-    [[ -n "$BACKUP_HOST"  ]] || die "backup_host is required"
     is_valid_host "$PRIMARY_HOST" || die "primary_host invalid: $PRIMARY_HOST"
-    is_valid_host "$BACKUP_HOST"  || die "backup_host invalid: $BACKUP_HOST"
     validate_port    "$PRIMARY_PORT"    primary_port
-    validate_port    "$BACKUP_PORT"     backup_port
+    if [[ -n "$BACKUP_HOST" ]]; then
+        is_valid_host "$BACKUP_HOST"  || die "backup_host invalid: $BACKUP_HOST"
+        validate_port    "$BACKUP_PORT"     backup_port
+    fi
     validate_port    "$LISTEN_PORT"     listen_port
     validate_pos_int "$CHECK_INTERVAL"  health_check_interval
     validate_pos_int "$CHECK_FALL"      health_check_fall
@@ -515,6 +516,7 @@ enter_degraded() {
     local reason="${1:-unknown}"
     log_warn "→ DEGRADED (${reason})"
     CURRENT_STATE="$STATE_DEGRADED"
+    PRIMARY_HOLD_UNTIL=0
     clear_backend
     reload_proxy
     write_state
@@ -556,11 +558,21 @@ initial_probe() {
     log_warn "Primary probe failed (${PRIMARY_HOST}:${PRIMARY_PORT})"
 
     # Try backup
-    proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-    if [[ "$proto" != "none" ]]; then
-        proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
-        log_info "Backup: OK [${proto}]"; enter_backup "$proto"; return; fi
-    log_warn "Backup probe failed (${BACKUP_HOST}:${BACKUP_PORT})"
+    if [[ -n "$BACKUP_HOST" ]]; then
+        proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+        if [[ "$proto" != "none" ]]; then
+            proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
+            log_info "Backup: OK [${proto}]"; enter_backup "$proto"; return; fi
+        log_warn "Backup probe failed (${BACKUP_HOST}:${BACKUP_PORT})"
+    fi
+
+    # Try external knxd
+    if [[ -n "$KNXD_HOST" ]]; then
+        proto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
+        if [[ "$proto" != "none" ]]; then
+            log_info "knxd: OK [${proto}]"; enter_knxd; return; fi
+        log_warn "knxd probe failed (${KNXD_HOST}:${KNXD_PORT})"
+    fi
 
     # Try USB as last resort
     if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
@@ -593,7 +605,11 @@ tick_primary() {
     rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
     if [[ "$rej_status" =~ ^0x(22|26|29)$ ]]; then
         log_warn "Primary tunnel hard-reject (${rej_status}) — failing over"
-        enter_backup_fast
+        if [[ -n "$BACKUP_HOST" ]]; then enter_backup_fast
+        elif [[ -n "$KNXD_HOST" ]]; then enter_knxd
+        elif [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then enter_usb
+        else enter_degraded "primary-hard-reject"
+        fi
         return 0
     fi
 
@@ -694,10 +710,12 @@ tick_usb() {
         proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
         log_notice "Primary recovered (from USB)"; enter_primary "$proto"; return 0; fi
 
-    proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-    if [[ "$proto" != "none" ]]; then
-        proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
-        log_notice "Backup recovered (from USB)"; enter_backup "$proto"; return 0; fi
+    if [[ -n "$BACKUP_HOST" ]]; then
+        proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+        if [[ "$proto" != "none" ]]; then
+            proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
+            log_notice "Backup recovered (from USB)"; enter_backup "$proto"; return 0; fi
+    fi
 
     # Check USB bridge is still alive
     if ! is_usb_bridge_alive; then
@@ -723,10 +741,12 @@ tick_degraded() {
     fi
 
     # Try backup
-    local proto; proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-    if [[ "$proto" != "none" ]]; then
-        proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
-        log_notice "Backup back [${proto}]"; enter_backup "$proto"; return 0; fi
+    if [[ -n "$BACKUP_HOST" ]]; then
+        local proto; proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+        if [[ "$proto" != "none" ]]; then
+            proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
+            log_notice "Backup back [${proto}]"; enter_backup "$proto"; return 0; fi
+    fi
 
     # Try external knxd
     if [[ -n "$KNXD_HOST" ]]; then
@@ -780,12 +800,14 @@ tick_knxd() {
             fi
             PRIMARY_RISE_COUNT=0
 
-            proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
-            if [[ "$proto" != "none" ]]; then
-                proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
-                log_notice "Backup recovered — moving from knxd to backup"
-                enter_backup "$proto"
-                return 0
+            if [[ -n "$BACKUP_HOST" ]]; then
+                proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+                if [[ "$proto" != "none" ]]; then
+                    proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
+                    log_notice "Backup recovered — moving from knxd to backup"
+                    enter_backup "$proto"
+                    return 0
+                fi
             fi
             ;;
     esac
