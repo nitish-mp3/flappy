@@ -327,21 +327,22 @@ class KNXProxy:
             )
         except Exception as e:
             log.error(f"Backend tunnel negotiation error: {e}")
-            bsock.close()
             report_backend_reject(b_host, b_port, b_proto, E_DATA_CONN)
             self._send_connect_error(client_type, client_ctrl, client_sock, E_DATA_CONN)
             return
+
+        # For TCP, negotiate_tunnel opens fresh sockets per attempt.
+        # The winning socket is in connector._last_good_sock.
+        if self.connector._last_good_sock is not None:
+            bsock = self.connector._last_good_sock
 
         if ch_id is None:
             final_status = status if status else E_DATA_CONN
 
             # Try protocol fallback if rejected with 0x22 (no free slots)
-            # Many KNX gateways have separate TCP and UDP tunnel slot pools.
-            # When one protocol's slots are full, the other may still work.
             if final_status == 0x22:
                 if b_proto == 'udp':
                     log.info("UDP tunnel rejected (0x22) — trying TCP fallback")
-                    bsock.close()
                     fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_tcp_fallback(
                         b_host, b_port, client_cri
                     )
@@ -358,7 +359,6 @@ class KNXProxy:
                         return
                 elif b_proto == 'tcp':
                     log.info("TCP tunnel rejected (0x22) — trying UDP fallback")
-                    bsock.close()
                     fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_udp_fallback(
                         b_host, b_port, client_cri
                     )
@@ -374,13 +374,11 @@ class KNXProxy:
                         self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
                         return
                 else:
-                    bsock.close()
                     report_backend_reject(b_host, b_port, b_proto, final_status)
                     self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
                     self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
                     return
             else:
-                bsock.close()
                 report_backend_reject(b_host, b_port, b_proto, final_status)
                 self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
                 self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
@@ -533,9 +531,12 @@ class KNXProxy:
             bsock, b_host, b_port, b_proto
         )
 
+        # For TCP, negotiate_tunnel opens fresh sockets per attempt.
+        if self.connector._last_good_sock is not None:
+            bsock = self.connector._last_good_sock
+
         # Protocol fallback: if 0x22 on one protocol, try the other
         if ch_id is None and status == 0x22:
-            bsock.close()
             alt_proto = 'udp' if b_proto == 'tcp' else 'tcp'
             log.info(f"Hot-swap: {b_proto.upper()} tunnel rejected (0x22) "
                      f"— trying {alt_proto.upper()} fallback")
@@ -557,7 +558,6 @@ class KNXProxy:
                     f"(status=0x{(status or 0):02x})")
 
         if ch_id is None:
-            bsock.close()
             raise RuntimeError(f"Backend rejected CONNECT (status=0x{(status or 0):02x})")
 
         # Setup keep-alive timeout for the long-running socket relay

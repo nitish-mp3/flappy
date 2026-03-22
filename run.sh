@@ -969,7 +969,7 @@ main() {
     # gateway for 60-120s. This sends DISCONNECT for ch_id 1-8 to free them.
     if [[ -n "$PRIMARY_HOST" ]]; then
         log_info "Clearing ghost sessions on ${PRIMARY_HOST}:${PRIMARY_PORT} [${PRIMARY_PROTOCOL}]..."
-        python3 -c "
+        PYTHONPATH=/ python3 -c "
 import logging; logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 from knx_health import clear_ghost_sessions
 clear_ghost_sessions('${PRIMARY_HOST}', ${PRIMARY_PORT}, '${PRIMARY_PROTOCOL}')
@@ -977,7 +977,7 @@ clear_ghost_sessions('${PRIMARY_HOST}', ${PRIMARY_PORT}, '${PRIMARY_PROTOCOL}')
         sleep 2  # Give gateway time to process
     fi
     if [[ -n "$BACKUP_HOST" ]]; then
-        python3 -c "
+        PYTHONPATH=/ python3 -c "
 import logging; logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 from knx_health import clear_ghost_sessions
 clear_ghost_sessions('${BACKUP_HOST}', ${BACKUP_PORT}, '${BACKUP_PROTOCOL}')
