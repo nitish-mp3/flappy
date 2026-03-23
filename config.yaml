@@ -5,7 +5,7 @@ description: >
   KNX/IP failover proxy with instant hot-failover,
   KNX IP Secure tunneling, USB via knxd, and configurable failback.
   Supports TCP, UDP, and USB interfaces in any combination.
-version: "4.2.0"
+version: "4.2.1"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -20,6 +20,9 @@ panel_icon: mdi:lan-connect
 panel_title: KNX Failover
 
 # ─── Network ──────────────────────────────────────────────────────────
+# host_network is REQUIRED — KNX gateways use UDP unicast/multicast
+# on the physical LAN; Docker bridge networking blocks these replies.
+host_network: true
 ports:
   3671/tcp: 3671
   3671/udp: 3671

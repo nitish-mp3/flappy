@@ -108,21 +108,32 @@ class HealthResult:
 
 def probe_description_udp(host: str, port: int, timeout: int = 5) -> HealthResult:
     """Send UDP DESCRIPTION_REQUEST and validate response."""
-    desc_req = b'\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57'
+    # Build DESCRIPTION_REQUEST dynamically with 0.0.0.0:0 HPAI
+    # Port 0 tells the gateway to reply to the UDP source address,
+    # which is the only reliable option behind NAT or Docker.
+    hpai = make_hpai('0.0.0.0', 0, PROTO_UDP)
+    desc_req = make_frame(DESCRIPTION_REQ, hpai)
     start = time.monotonic()
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
     try:
         s.bind(('0.0.0.0', 0))
+        local_addr = s.getsockname()
+        log.debug(f"UDP probe {host}:{port} from {local_addr[0]}:{local_addr[1]} (timeout={timeout}s)")
         s.sendto(desc_req, (host, port))
-        data, _ = s.recvfrom(512)
+        data, src = s.recvfrom(512)
         elapsed = (time.monotonic() - start) * 1000
         if valid_desc_response(data):
+            log.debug(f"UDP probe {host}:{port} OK ({elapsed:.0f}ms, {len(data)}B from {src[0]}:{src[1]})")
             return HealthResult(True, 'udp', elapsed, tunnel_ok=False)
+        log.debug(f"UDP probe {host}:{port} got invalid response ({len(data)}B)")
         return HealthResult(False, 'udp', elapsed, error='invalid response')
     except socket.timeout:
-        return HealthResult(False, 'udp', error='timeout')
+        elapsed = (time.monotonic() - start) * 1000
+        log.debug(f"UDP probe {host}:{port} timed out after {elapsed:.0f}ms")
+        return HealthResult(False, 'udp', error=f'timeout ({timeout}s)')
     except Exception as e:
+        log.debug(f"UDP probe {host}:{port} error: {e}")
         return HealthResult(False, 'udp', error=str(e))
     finally:
         s.close()
@@ -130,21 +141,31 @@ def probe_description_udp(host: str, port: int, timeout: int = 5) -> HealthResul
 
 def probe_description_tcp(host: str, port: int, timeout: int = 5) -> HealthResult:
     """Send TCP DESCRIPTION_REQUEST and validate response."""
-    desc_req = b'\x06\x10\x02\x03\x00\x0e\x08\x01\x00\x00\x00\x00\x0e\x57'
+    hpai = make_hpai('0.0.0.0', 0, PROTO_TCP)
+    desc_req = make_frame(DESCRIPTION_REQ, hpai)
     start = time.monotonic()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
+        log.debug(f"TCP probe {host}:{port} connecting (timeout={timeout}s)")
         s.connect((host, port))
         s.sendall(desc_req)
         data = s.recv(512)
         elapsed = (time.monotonic() - start) * 1000
         if valid_desc_response(data):
+            log.debug(f"TCP probe {host}:{port} OK ({elapsed:.0f}ms, {len(data)}B)")
             return HealthResult(True, 'tcp', elapsed, tunnel_ok=False)
+        log.debug(f"TCP probe {host}:{port} got invalid response ({len(data)}B)")
         return HealthResult(False, 'tcp', elapsed, error='invalid response')
     except socket.timeout:
-        return HealthResult(False, 'tcp', error='timeout')
+        elapsed = (time.monotonic() - start) * 1000
+        log.debug(f"TCP probe {host}:{port} timed out after {elapsed:.0f}ms")
+        return HealthResult(False, 'tcp', error=f'timeout ({timeout}s)')
+    except ConnectionRefusedError:
+        log.debug(f"TCP probe {host}:{port} connection refused")
+        return HealthResult(False, 'tcp', error='connection refused')
     except Exception as e:
+        log.debug(f"TCP probe {host}:{port} error: {e}")
         return HealthResult(False, 'tcp', error=str(e))
     finally:
         s.close()
@@ -296,7 +317,7 @@ def detect_protocol(host: str, port: int, prefer: str = 'tcp',
     3. If the gateway responds to DESCRIPTION, it is alive — return
        the preferred protocol (the user's configured choice).
     """
-    log.debug(f"Detecting protocol for {host}:{port} (prefer={prefer})")
+    log.info(f"Probing {host}:{port} (prefer={prefer}, timeout={timeout}s)")
 
     # Build probe order based on preference
     if prefer in ('tcp', 'auto'):
@@ -313,17 +334,14 @@ def detect_protocol(host: str, port: int, prefer: str = 'tcp',
     for proto, probe_fn in probe_order:
         result = probe_fn(host, port, timeout)
         if result.ok:
-            # Gateway is alive. Return the preferred protocol (user's choice)
-            # rather than the detected one, because DESCRIPTION support on TCP
-            # does not guarantee TCP tunneling support and vice versa.
-            # The user's config (prefer) is the authoritative source.
             chosen = prefer if prefer in ('tcp', 'udp') else proto
-            log.debug(f"  → Gateway alive via {proto} description "
-                      f"({result.latency_ms:.0f}ms), using {chosen}")
+            log.info(f"Probe {host}:{port} → alive via {proto.upper()} "
+                     f"({result.latency_ms:.0f}ms), will use {chosen.upper()}")
             return chosen
         else:
-            log.debug(f"  → {proto} description failed: {result.error}")
+            log.info(f"Probe {host}:{port} → {proto.upper()} failed: {result.error}")
 
+    log.warning(f"Probe {host}:{port} → unreachable (all protocols failed)")
     return 'none'
 
 

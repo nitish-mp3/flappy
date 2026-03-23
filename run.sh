@@ -245,8 +245,7 @@ ha_notify() {
 # Protocol detection (delegates to Python health module)
 # ---------------------------------------------------------------------------
 detect_protocol() {
-    local host="$1" port="$2"
-    local prefer="${PRIMARY_PROTOCOL}"
+    local host="$1" port="$2" prefer="${3:-$PRIMARY_PROTOCOL}"
     [[ "$prefer" == "auto" ]] && prefer="tcp"
     python3 - "$host" "$port" "$prefer" "$CONNECTION_TIMEOUT" <<'PYEOF'
 import sys
@@ -635,7 +634,7 @@ initial_probe() {
     # Try primary
     if [[ -n "$PRIMARY_HOST" ]]; then
         local proto
-        proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+        proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT" "$PRIMARY_PROTOCOL")"
         if [[ "$proto" != "none" ]]; then
             proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
             log_info "Primary: OK [${proto}]"; enter_primary "$proto"; return; fi
@@ -644,7 +643,7 @@ initial_probe() {
 
     # Try backup
     if [[ -n "$BACKUP_HOST" ]]; then
-        proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+        proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT" "$BACKUP_PROTOCOL")"
         if [[ "$proto" != "none" ]]; then
             proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
             log_info "Backup: OK [${proto}]"; enter_backup "$proto"; return; fi
@@ -653,7 +652,7 @@ initial_probe() {
 
     # Try external knxd
     if [[ -n "$KNXD_HOST" ]]; then
-        proto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
+        proto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT" "$KNXD_PROTOCOL")"
         if [[ "$proto" != "none" ]]; then
             proto="$(select_backend_proto "$proto" "$KNXD_PROTOCOL")"
             log_info "knxd: OK [${proto}]"; enter_knxd "$proto"; return; fi
@@ -701,7 +700,7 @@ tick_primary() {
 
     # Probe primary health
     local proto
-    proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+    proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT" "$PRIMARY_PROTOCOL")"
     if [[ "$proto" != "none" ]]; then
         # Check for soft rejects
         rej_status="$(read_backend_reject_status "$PRIMARY_HOST" "$PRIMARY_PORT")"
@@ -726,7 +725,7 @@ tick_primary() {
     if [[ "$PRIMARY_FAIL_COUNT" -ge "$CHECK_FALL" ]]; then
         log_warn "Primary failed — initiating failover"
         if [[ -n "$BACKUP_HOST" ]]; then
-            local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+            local bproto; bproto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT" "$BACKUP_PROTOCOL")"
             if [[ "$bproto" != "none" ]]; then
                 bproto="$(select_backend_proto "$bproto" "$BACKUP_PROTOCOL")"
                 enter_backup "$bproto"
@@ -734,7 +733,7 @@ tick_primary() {
             fi
         fi
         if [[ -n "$KNXD_HOST" ]]; then
-            local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
+            local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT" "$KNXD_PROTOCOL")"
             if [[ "$kproto" != "none" ]]; then
                 kproto="$(select_backend_proto "$kproto" "$KNXD_PROTOCOL")"
                 enter_knxd "$kproto"
@@ -756,7 +755,7 @@ tick_backup() {
     if [[ "$rej_status" == "0x29" ]]; then
         log_warn "Backup tunnel not supported (0x29)"
         if [[ -n "$KNXD_HOST" ]]; then
-            local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
+            local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT" "$KNXD_PROTOCOL")"
             if [[ "$kproto" != "none" ]]; then
                 kproto="$(select_backend_proto "$kproto" "$KNXD_PROTOCOL")"
                 enter_knxd "$kproto"
@@ -790,7 +789,7 @@ tick_backup() {
             fi
 
             local proto
-            proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+            proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT" "$PRIMARY_PROTOCOL")"
             if [[ "$proto" != "none" ]]; then
                 proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
                 PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
@@ -813,7 +812,7 @@ tick_usb() {
     if [[ "$USB_PRIORITY" != "prefer" ]]; then
         if [[ -n "$PRIMARY_HOST" ]]; then
             local proto
-            proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+            proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT" "$PRIMARY_PROTOCOL")"
             if [[ "$proto" != "none" ]]; then
                 proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
                 log_notice "Primary recovered (from USB)"; enter_primary "$proto"; return 0; fi
@@ -821,7 +820,7 @@ tick_usb() {
 
         if [[ -n "$BACKUP_HOST" ]]; then
             local proto
-            proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+            proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT" "$BACKUP_PROTOCOL")"
             if [[ "$proto" != "none" ]]; then
                 proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
                 log_notice "Backup recovered (from USB)"; enter_backup "$proto"; return 0; fi
@@ -845,7 +844,7 @@ tick_degraded() {
 
     # Try primary (unless in holdoff)
     if ! is_failback_holdoff_active && [[ -n "$PRIMARY_HOST" ]]; then
-        local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+        local proto; proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT" "$PRIMARY_PROTOCOL")"
         if [[ "$proto" != "none" ]]; then
             proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
             log_notice "Primary back [${proto}]"; enter_primary "$proto"; return 0; fi
@@ -853,7 +852,7 @@ tick_degraded() {
 
     # Try backup
     if [[ -n "$BACKUP_HOST" ]]; then
-        local proto; proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+        local proto; proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT" "$BACKUP_PROTOCOL")"
         if [[ "$proto" != "none" ]]; then
             proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
             log_notice "Backup back [${proto}]"; enter_backup "$proto"; return 0; fi
@@ -861,7 +860,7 @@ tick_degraded() {
 
     # Try external knxd
     if [[ -n "$KNXD_HOST" ]]; then
-        local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT")"
+        local kproto; kproto="$(detect_protocol "$KNXD_HOST" "$KNXD_PORT" "$KNXD_PROTOCOL")"
         if [[ "$kproto" != "none" ]]; then
             kproto="$(select_backend_proto "$kproto" "$KNXD_PROTOCOL")"
             log_notice "knxd available"; enter_knxd "$kproto"; return 0; fi
@@ -901,7 +900,7 @@ tick_knxd() {
 
             if [[ -n "$PRIMARY_HOST" ]]; then
                 local proto
-                proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT")"
+                proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT" "$PRIMARY_PROTOCOL")"
                 if [[ "$proto" != "none" ]]; then
                     proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
                     PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
@@ -916,7 +915,7 @@ tick_knxd() {
             fi
 
             if [[ -n "$BACKUP_HOST" ]]; then
-                proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT")"
+                proto="$(detect_protocol "$BACKUP_HOST" "$BACKUP_PORT" "$BACKUP_PROTOCOL")"
                 if [[ "$proto" != "none" ]]; then
                     proto="$(select_backend_proto "$proto" "$BACKUP_PROTOCOL")"
                     log_notice "Backup recovered — moving from knxd to backup"
@@ -1001,18 +1000,21 @@ main() {
     if [[ -n "$PRIMARY_HOST" ]]; then
         log_info "Clearing ghost sessions on ${PRIMARY_HOST}:${PRIMARY_PORT} [${PRIMARY_PROTOCOL}]..."
         PYTHONPATH=/ python3 -c "
-import logging; logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+import logging, sys; logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 from knx_health import clear_ghost_sessions
-clear_ghost_sessions('${PRIMARY_HOST}', ${PRIMARY_PORT}, '${PRIMARY_PROTOCOL}')
-" 2>&1 | while read -r line; do log_debug "$line"; done || true
+n = clear_ghost_sessions('${PRIMARY_HOST}', ${PRIMARY_PORT}, '${PRIMARY_PROTOCOL}')
+print(n)
+" 2>/dev/null || true
         sleep 2  # Give gateway time to process
     fi
-    if [[ -n "$BACKUP_HOST" ]]; then
+    if [[ -n "$BACKUP_HOST" ]] && [[ "$BACKUP_HOST" != "$PRIMARY_HOST" || "$BACKUP_PORT" != "$PRIMARY_PORT" ]]; then
+        log_info "Clearing ghost sessions on ${BACKUP_HOST}:${BACKUP_PORT} [${BACKUP_PROTOCOL}]..."
         PYTHONPATH=/ python3 -c "
-import logging; logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+import logging, sys; logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 from knx_health import clear_ghost_sessions
-clear_ghost_sessions('${BACKUP_HOST}', ${BACKUP_PORT}, '${BACKUP_PROTOCOL}')
-" 2>&1 | while read -r line; do log_debug "$line"; done || true
+n = clear_ghost_sessions('${BACKUP_HOST}', ${BACKUP_PORT}, '${BACKUP_PROTOCOL}')
+print(n)
+" 2>/dev/null || true
     fi
 
     # Probe all backends FIRST — find a working one before accepting clients.
