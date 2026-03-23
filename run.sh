@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# KNX Failover Proxy v3.0.0  — Backend Manager
+# KNX Failover Proxy v4.1.3  — Backend Manager
 # =============================================================================
 # This script:
 #   1. Loads config from /data/options.json
@@ -19,9 +19,10 @@ readonly METRICS_FILE="/run/knx-metrics.json"
 readonly KNXD_PID_FILE="/run/knxd.pid"
 readonly SOCAT_PID_FILE="/run/knx-bridge.pid"
 readonly PROXY_PID_FILE="/run/knx-proxy.pid"
+readonly WEBUI_PID_FILE="/run/knx-webui.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="4.1.0"
+readonly VERSION="4.2.0"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -57,6 +58,7 @@ HAS_KNXD=false
 HAS_PYUSB=false
 USB_LOCAL_PORT=13671
 NATIVE_USB_PID=""
+WEBUI_PID=""
 readonly NATIVE_USB_PID_FILE="/run/knx-usb-bridge.pid"
 
 # ---------------------------------------------------------------------------
@@ -260,7 +262,7 @@ PYEOF
 }
 
 usb_probe() {
-    [[ -n "$1" ]] && [[ -e "$1" ]] && [[ -r "$1" ]] && [[ -w "$1" ]]; return $?
+    [[ -n "$1" ]] && [[ -e "$1" ]] && [[ -r "$1" ]] && [[ -w "$1" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -928,10 +930,39 @@ tick_knxd() {
 }
 
 # ---------------------------------------------------------------------------
+# Web UI
+# ---------------------------------------------------------------------------
+start_webui() {
+    stop_webui
+    local port="${INGRESS_PORT:-8099}"
+    log_info "Starting Web UI on port ${port}"
+    python3 /knx_webui.py "$port" &
+    WEBUI_PID="$!"
+    echo "$WEBUI_PID" > "$WEBUI_PID_FILE"
+    sleep 1
+    if ! kill -0 "$WEBUI_PID" 2>/dev/null; then
+        log_warn "Web UI failed to start (non-critical)"
+        WEBUI_PID=""; rm -f "$WEBUI_PID_FILE"
+    else
+        log_info "Web UI started (pid=${WEBUI_PID})"
+    fi
+    return 0
+}
+
+stop_webui() {
+    local pid="${WEBUI_PID}"
+    [[ -z "$pid" ]] && pid="$(cat "$WEBUI_PID_FILE" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && {
+        kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+    rm -f "$WEBUI_PID_FILE"; WEBUI_PID=""; return 0
+}
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 cleanup() {
     log_info "Shutting down..."
+    stop_webui    || true
     stop_proxy    || true
     stop_usb_bridge || true
     rm -f "$STATE_FILE" "$BACKEND_FILE" "$BACKEND_REJECT_FILE" \
@@ -988,6 +1019,9 @@ clear_ghost_sessions('${BACKUP_HOST}', ${BACKUP_PORT}, '${BACKUP_PROTOCOL}')
     # Starting the proxy before a backend is ready causes a flood of
     # "CONNECT rejected — no backend configured" errors from HA.
     initial_probe
+
+    # Start web UI (ingress) before proxy — non-blocking, non-critical
+    start_webui
 
     # NOW start the proxy — clients will connect to an already-configured backend
     start_proxy || die "Cannot start KNX proxy"

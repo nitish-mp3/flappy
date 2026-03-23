@@ -38,6 +38,16 @@ class UDPTransport:
             pass
         self.sock.bind(('0.0.0.0', self.port))
         self.sock.settimeout(2.0)
+
+        # Join KNX multicast group for ETS discovery (224.0.23.12)
+        try:
+            KNX_MULTICAST = '224.0.23.12'
+            mreq = socket.inet_aton(KNX_MULTICAST) + socket.inet_aton('0.0.0.0')
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            log.info(f"Joined KNX multicast group {KNX_MULTICAST} (ETS discovery enabled)")
+        except Exception as e:
+            log.warning(f"Multicast join failed: {e} — ETS discovery may not work")
+
         self.running = True
 
         self._thread = threading.Thread(target=self._recv_loop,

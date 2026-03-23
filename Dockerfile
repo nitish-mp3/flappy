@@ -35,6 +35,8 @@ COPY knx_session.py   /knx_session.py
 COPY knx_health.py    /knx_health.py
 COPY knx_const.py     /knx_const.py
 COPY knx_usb.py       /knx_usb.py
+COPY knx_webui.py     /knx_webui.py
+COPY www/             /www/
 
 RUN chmod 0755 \
         /run.sh \
@@ -46,6 +48,7 @@ RUN chmod 0755 \
         /knx_health.py \
         /knx_const.py \
         /knx_usb.py \
+        /knx_webui.py \
         /etc/cont-init.d/knx-failover.sh \
         /etc/services.d/knx-failover/run \
         /etc/services.d/knx-failover/finish

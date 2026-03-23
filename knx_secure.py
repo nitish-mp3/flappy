@@ -159,20 +159,19 @@ class SecureSession:
     def build_session_authenticate(self) -> bytes:
         """
         Build a SESSION_AUTHENTICATE frame.
-        Uses device_password to create authentication MAC.
+        Uses user_password (for tunnelling) to create authentication MAC.
         """
         if not self.session_key:
             raise RuntimeError("Session key not derived yet")
 
         from knx_const import make_frame
 
-        # Build authentication data
         # user_id = 0x01 for management, 0x02+ for tunnelling
         user_id = 0x01
 
-        # Hash the device password for the authentication code
-        if self.device_password:
-            pwd_hash = self._password_hash(self.device_password)
+        # Authenticate using user password (not device password)
+        if self.user_password:
+            pwd_hash = self._password_hash(self.user_password, is_device_auth=False)
         else:
             pwd_hash = bytes(16)
 
@@ -284,16 +283,21 @@ class SecureSession:
         """Compute HMAC-SHA256 truncated to 16 bytes (for auth)."""
         return hmac.new(key, data, hashlib.sha256).digest()[:16]
 
-    def _password_hash(self, password: bytes) -> bytes:
+    def _password_hash(self, password: bytes, is_device_auth: bool = False) -> bytes:
         """
         Hash a password per KNX spec.
-        PBKDF2-HMAC-SHA256 with fixed salt and iterations.
+        PBKDF2-HMAC-SHA256 with spec-defined salt and 65536 iterations.
+
+        Device authentication code and user password use different salts.
         """
-        # KNX uses PBKDF2 with specific parameters
+        if is_device_auth:
+            salt = b'device-authentication-code.1.secure.ip.knx.org'
+        else:
+            salt = b'user-password.1.secure.ip.knx.org'
         return hashlib.pbkdf2_hmac(
             'sha256',
             password,
-            b'user-password.1.secure.ip.knx.org',
+            salt,
             65536,
             dklen=16
         )

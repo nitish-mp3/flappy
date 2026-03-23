@@ -10,7 +10,7 @@ import struct
 from typing import Optional, Tuple
 
 # ── Version ───────────────────────────────────────────────────────────
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 
 # ── File Paths ────────────────────────────────────────────────────────
 BACKEND_FILE        = "/run/knx-active-backend"
@@ -181,8 +181,15 @@ def read_tcp_frame(sock: socket.socket) -> Tuple[Optional[int], Optional[bytes]]
 
 
 def tunnel_channel_id(body: bytes) -> int:
-    """Extract channel_id from a TUNNELLING_REQ/ACK body."""
-    return body[2] if len(body) >= 4 else 0
+    """Extract channel_id from a TUNNELLING_REQ/ACK body.
+
+    Body layout (connection header):
+      body[0] = structure length (0x04)
+      body[1] = communication channel ID
+      body[2] = sequence counter
+      body[3] = reserved
+    """
+    return body[1] if len(body) >= 4 else 0
 
 
 def valid_desc_response(data: bytes) -> bool:

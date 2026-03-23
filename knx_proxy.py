@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KNX/IP Failover Proxy  v3.0.0
+KNX/IP Failover Proxy  v4.1.3
 ===============================
 Production-grade KNX/IP tunnelling proxy with:
   - TCP ↔ TCP, TCP ↔ UDP, UDP ↔ TCP, UDP ↔ UDP
@@ -680,9 +680,113 @@ class KNXProxy:
                 sess.close()
 
         elif svc in (SECURE_SESSION_REQ, SECURE_WRAPPER):
-            log.debug(f"Secure frame from UDP client — passing through")
-            # For secure-to-secure passthrough, forward as-is
-            # The backend connector handles the secure establishment
+            # KNX IP Secure requires TCP — cannot operate over UDP
+            log.warning(f"Secure frame {svc_name(svc)} received via UDP — "
+                        f"KNX IP Secure requires TCP frontend")
+
+    # ──────────────────────────────────────────────────────────────────
+    # Secure tunneling — transparent TCP passthrough
+    # ──────────────────────────────────────────────────────────────────
+
+    def _handle_secure_passthrough(self, client_sock: socket.socket,
+                                    client_addr: Tuple[str, int],
+                                    first_svc: int, first_body: bytes):
+        """
+        Handle KNX IP Secure tunneling by relaying all TCP data between
+        client and backend transparently. The proxy does NOT terminate or
+        inspect the secure session — the ECDH key exchange and AES-CCM
+        encryption happen end-to-end between client (xknx) and the
+        KNX gateway.
+
+        Flow:
+          1. Client sends SESSION_REQUEST → forwarded to backend
+          2. Backend replies SESSION_RESPONSE → forwarded to client
+          3. Client sends SESSION_AUTHENTICATE → forwarded to backend
+          4. Backend replies SESSION_STATUS → forwarded to client
+          5. All subsequent traffic (SECURE_WRAPPER) relayed as raw bytes
+        """
+        backend = read_backend()
+        if backend is None:
+            log.warning("Secure passthrough rejected — no backend configured")
+            return
+
+        b_host, b_port, _ = backend
+
+        # KNX IP Secure always runs over TCP
+        try:
+            backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            backend_sock.settimeout(5.0)
+            backend_sock.connect((b_host, b_port))
+        except Exception as e:
+            log.error(f"Secure passthrough: cannot connect to backend "
+                      f"{b_host}:{b_port}: {e}")
+            return
+
+        # Forward the initial SECURE_SESSION_REQ to the backend
+        first_frame = make_frame(first_svc, first_body)
+        try:
+            backend_sock.sendall(first_frame)
+        except Exception as e:
+            log.error(f"Secure passthrough: failed to forward SESSION_REQ: {e}")
+            backend_sock.close()
+            return
+
+        log.info(f"Secure tunnel passthrough: "
+                 f"{client_addr[0]}:{client_addr[1]} ↔ {b_host}:{b_port}")
+
+        # Set relay timeouts — long enough for idle KNX sessions,
+        # short enough to detect shutdown promptly
+        client_sock.settimeout(10.0)
+        backend_sock.settimeout(10.0)
+
+        stop = threading.Event()
+
+        def _relay(src: socket.socket, dst: socket.socket, label: str):
+            """Relay data from src to dst until either side closes."""
+            try:
+                while not stop.is_set() and self.running:
+                    try:
+                        data = src.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
+                    if not data:
+                        break
+                    try:
+                        dst.sendall(data)
+                    except Exception:
+                        break
+            finally:
+                stop.set()
+
+        t_c2b = threading.Thread(target=_relay,
+                                  args=(client_sock, backend_sock, "c→b"),
+                                  daemon=True)
+        t_b2c = threading.Thread(target=_relay,
+                                  args=(backend_sock, client_sock, "b→c"),
+                                  daemon=True)
+        t_c2b.start()
+        t_b2c.start()
+
+        # Wait until one side closes or proxy shuts down
+        while not stop.is_set() and self.running:
+            stop.wait(timeout=2.0)
+
+        stop.set()
+
+        # Clean up backend socket (client socket closed by caller's finally)
+        try:
+            backend_sock.close()
+        except Exception:
+            pass
+
+        # Wait for relay threads to finish
+        t_c2b.join(timeout=3)
+        t_b2c.join(timeout=3)
+
+        log.info(f"Secure tunnel passthrough ended: "
+                 f"{client_addr[0]}:{client_addr[1]} ↔ {b_host}:{b_port}")
 
     # ──────────────────────────────────────────────────────────────────
     # TCP client handler
@@ -781,9 +885,17 @@ class KNXProxy:
                         sess.close()
                     break
 
-                elif svc in (SECURE_SESSION_REQ, SECURE_WRAPPER,
+                elif svc == SECURE_SESSION_REQ:
+                    # Client wants KNX IP Secure — switch to transparent relay
+                    self._handle_secure_passthrough(sock, addr, svc, body)
+                    return  # Passthrough took over; caller's finally closes sock
+
+                elif svc in (SECURE_WRAPPER,
                              SECURE_SESSION_AUTH, SECURE_SESSION_STATUS):
-                    log.debug(f"Secure frame from TCP client — passing through")
+                    # These should only appear after SESSION_REQ (passthrough).
+                    # If seen here, the client sent them out of order.
+                    log.warning(f"Unexpected {svc_name(svc)} without active "
+                                f"secure session — ignoring")
 
         except Exception as e:
             log.debug(f"TCP client {addr}: {e}")
