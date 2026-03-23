@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KNX Failover Proxy</title>
+<style>
+/* ── Reset & Base ──────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:        #0d1117;
+  --bg2:       #161b22;
+  --card:      #1c2128;
+  --card-alt:  #21262d;
+  --border:    #30363d;
+  --text:      #e6edf3;
+  --text2:     #8b949e;
+  --accent:    #58a6ff;
+  --accent2:   #1f6feb;
+  --green:     #3fb950;
+  --orange:    #d29922;
+  --red:       #f85149;
+  --purple:    #bc8cff;
+  --radius:    8px;
+  --shadow:    0 1px 3px rgba(0,0,0,.4);
+  --font:      -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;
+}
+html{font-size:14px}
+body{font-family:var(--font);background:var(--bg);color:var(--text);
+  display:flex;min-height:100vh;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none}
+button{font-family:var(--font);cursor:pointer}
+input,select,textarea{font-family:var(--font);font-size:.93rem}
+
+/* ── Sidebar ───────────────────────────────────────────────────── */
+.sidebar{width:220px;background:var(--bg2);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;flex-shrink:0;position:sticky;top:0;height:100vh}
+.sidebar .brand{padding:20px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.sidebar .brand svg{width:28px;height:28px;fill:var(--accent)}
+.sidebar .brand h1{font-size:1rem;font-weight:600;color:var(--text)}
+.sidebar .brand small{display:block;font-size:.72rem;color:var(--text2);font-weight:400}
+.sidebar nav{flex:1;padding:8px 0}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 16px;color:var(--text2);
+  font-size:.9rem;border-left:3px solid transparent;transition:all .15s}
+.nav-item:hover{color:var(--text);background:rgba(88,166,255,.06)}
+.nav-item.active{color:var(--accent);border-left-color:var(--accent);background:rgba(88,166,255,.1);font-weight:500}
+.nav-item svg{width:18px;height:18px;fill:currentColor;flex-shrink:0}
+.sidebar-footer{padding:12px 16px;border-top:1px solid var(--border);font-size:.75rem;color:var(--text2)}
+
+/* ── Main Content ──────────────────────────────────────────────── */
+.main{flex:1;padding:24px 28px;min-width:0;overflow-y:auto}
+.page{display:none}
+.page.active{display:block}
+.page-title{font-size:1.35rem;font-weight:600;margin-bottom:20px}
+
+/* ── Cards ─────────────────────────────────────────────────────── */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px;margin-bottom:20px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:18px;box-shadow:var(--shadow)}
+.card-header{font-size:.8rem;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;
+  display:flex;justify-content:space-between;align-items:center}
+.card-wide{grid-column:1/-1}
+
+/* ── Status card ───────────────────────────────────────────────── */
+.status-card{display:flex;align-items:center;gap:16px}
+.status-dot{width:52px;height:52px;border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 20px rgba(0,0,0,.3);transition:background .4s}
+.status-dot.green{background:var(--green);box-shadow:0 0 16px rgba(63,185,80,.3)}
+.status-dot.blue{background:var(--accent);box-shadow:0 0 16px rgba(88,166,255,.3)}
+.status-dot.orange{background:var(--orange);box-shadow:0 0 16px rgba(210,153,34,.3)}
+.status-dot.red{background:var(--red);box-shadow:0 0 16px rgba(248,81,73,.3)}
+.status-dot.purple{background:var(--purple);box-shadow:0 0 16px rgba(188,140,255,.3)}
+.status-dot svg{width:24px;height:24px;fill:#fff}
+.status-text h3{font-size:1.15rem;font-weight:600}
+.status-text p{font-size:.85rem;color:var(--text2);margin-top:2px}
+
+/* ── Big Number ────────────────────────────────────────────────── */
+.big-num{font-size:2rem;font-weight:700;line-height:1}
+.big-num small{font-size:.9rem;font-weight:400;color:var(--text2)}
+.stat-row{display:flex;justify-content:space-between;padding:6px 0;
+  border-bottom:1px solid var(--border);font-size:.88rem}
+.stat-row:last-child{border:none}
+.stat-label{color:var(--text2)}
+
+/* ── Table ─────────────────────────────────────────────────────── */
+.tbl{width:100%;border-collapse:collapse;font-size:.87rem}
+.tbl th{text-align:left;padding:10px 12px;color:var(--text2);font-weight:500;
+  border-bottom:1px solid var(--border);font-size:.78rem;text-transform:uppercase;letter-spacing:.4px}
+.tbl td{padding:10px 12px;border-bottom:1px solid var(--border)}
+.tbl tr:last-child td{border:none}
+.tbl .empty{text-align:center;color:var(--text2);padding:28px}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:500}
+.badge-green{background:rgba(63,185,80,.15);color:var(--green)}
+.badge-blue{background:rgba(88,166,255,.15);color:var(--accent)}
+.badge-orange{background:rgba(210,153,34,.15);color:var(--orange)}
+.badge-red{background:rgba(248,81,73,.15);color:var(--red)}
+
+/* ── Forms ─────────────────────────────────────────────────────── */
+.form-section{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  margin-bottom:16px;overflow:hidden}
+.form-header{padding:14px 18px;background:var(--card-alt);border-bottom:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none}
+.form-header h3{font-size:.92rem;font-weight:600}
+.form-header .arrow{transition:transform .2s;color:var(--text2)}
+.form-header .arrow.open{transform:rotate(180deg)}
+.form-body{padding:18px;display:none}
+.form-body.open{display:block}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.form-group{display:flex;flex-direction:column;gap:4px}
+.form-group label{font-size:.82rem;color:var(--text2);font-weight:500}
+.form-group input,.form-group select{padding:8px 10px;background:var(--bg);
+  border:1px solid var(--border);border-radius:5px;color:var(--text);outline:none;transition:border .2s}
+.form-group input:focus,.form-group select:focus{border-color:var(--accent)}
+.form-group input[type=checkbox]{width:auto;align-self:flex-start;margin-top:4px;
+  width:18px;height:18px;accent-color:var(--accent)}
+.form-group .help{font-size:.75rem;color:var(--text2)}
+.secure-fields{display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}
+.secure-fields.visible{display:block}
+
+/* ── Buttons ───────────────────────────────────────────────────── */
+.btn{padding:8px 18px;border-radius:5px;border:1px solid var(--border);
+  background:var(--card-alt);color:var(--text);font-size:.87rem;font-weight:500;transition:all .15s}
+.btn:hover{background:var(--border)}
+.btn-primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
+.btn-primary:hover{background:var(--accent)}
+.btn-danger{background:rgba(248,81,73,.15);border-color:var(--red);color:var(--red)}
+.btn-danger:hover{background:rgba(248,81,73,.25)}
+.btn-sm{padding:5px 12px;font-size:.8rem}
+.btn-group{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap}
+
+/* ── USB Devices ───────────────────────────────────────────────── */
+.device-card{background:var(--card-alt);border:1px solid var(--border);border-radius:var(--radius);
+  padding:14px;display:flex;gap:14px;align-items:center}
+.device-icon{width:44px;height:44px;border-radius:8px;background:rgba(88,166,255,.1);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.device-icon svg{width:22px;height:22px;fill:var(--accent)}
+.device-info{flex:1;min-width:0}
+.device-info strong{display:block;font-size:.9rem}
+.device-info span{font-size:.8rem;color:var(--text2)}
+.device-list{display:grid;gap:10px;margin-top:14px}
+
+/* ── Toast ─────────────────────────────────────────────────────── */
+.toast-container{position:fixed;top:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px}
+.toast{padding:12px 18px;border-radius:var(--radius);color:#fff;font-size:.87rem;
+  box-shadow:0 4px 12px rgba(0,0,0,.4);animation:slideIn .3s ease;min-width:240px}
+.toast-success{background:#238636}
+.toast-error{background:#da3633}
+.toast-info{background:var(--accent2)}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:none;opacity:1}}
+
+/* ── Responsive ────────────────────────────────────────────────── */
+@media(max-width:768px){
+  .sidebar{display:none}
+  .main{padding:16px}
+  .cards{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════ Sidebar ═══════ -->
+<aside class="sidebar">
+  <div class="brand">
+    <svg viewBox="0 0 24 24"><path d="M12 2L2 7v10l10 5 10-5V7L12 2zm0 2.18L19.35 7.5 12 10.82 4.65 7.5 12 4.18zM4 8.93l7 3.5v7.64l-7-3.5V8.93zm9 11.14V12.43l7-3.5v7.64l-7 3.5z"/></svg>
+    <h1>KNX Failover<small>Proxy Manager</small></h1>
+  </div>
+  <nav>
+    <a class="nav-item active" data-page="dashboard" href="#">
+      <svg viewBox="0 0 24 24"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+      <span>Dashboard</span>
+    </a>
+    <a class="nav-item" data-page="config" href="#">
+      <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.611 3.611 0 0112 15.6z"/></svg>
+      <span>Configuration</span>
+    </a>
+    <a class="nav-item" data-page="devices" href="#">
+      <svg viewBox="0 0 24 24"><path d="M15 7v4h1v2h-3V5h2l-3-4-3 4h2v8H8v-2.07c.7-.37 1.2-1.08 1.2-1.93 0-1.21-.99-2.2-2.2-2.2-1.21 0-2.2.99-2.2 2.2 0 .85.5 1.56 1.2 1.93V13c0 1.11.89 2 2 2h3v3.05c-.71.37-1.2 1.1-1.2 1.95a2.2 2.2 0 004.4 0c0-.85-.49-1.58-1.2-1.95V15h3c1.11 0 2-.89 2-2v-2h1V7h-4z"/></svg>
+      <span>Devices</span>
+    </a>
+    <a class="nav-item" data-page="sessions" href="#">
+      <svg viewBox="0 0 24 24"><path d="M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z"/></svg>
+      <span>Sessions</span>
+    </a>
+  </nav>
+  <div class="sidebar-footer">
+    <div>KNX Failover Proxy</div>
+    <div id="sidebarVersion">v4.2.0</div>
+  </div>
+</aside>
+
+<!-- ═══════ Main Content ═══════ -->
+<div class="main">
+
+<!-- ── Dashboard ──────────────────────────────────────────────── -->
+<div id="page-dashboard" class="page active">
+  <h2 class="page-title">Dashboard</h2>
+  <div class="cards">
+    <!-- Status -->
+    <div class="card status-card" id="statusCard">
+      <div class="status-dot" id="statusDot">
+        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+      </div>
+      <div class="status-text">
+        <h3 id="stateName">Connecting…</h3>
+        <p id="stateDesc">Checking backend status</p>
+      </div>
+    </div>
+    <!-- Backend -->
+    <div class="card">
+      <div class="card-header">Active Backend</div>
+      <div id="backendInfo" style="font-size:.95rem">
+        <span style="color:var(--text2)">Loading…</span>
+      </div>
+    </div>
+    <!-- Sessions -->
+    <div class="card">
+      <div class="card-header">Tunnel Sessions</div>
+      <div><span class="big-num" id="sessionCount">-</span>
+        <small> / <span id="sessionMax">8</span></small></div>
+    </div>
+    <!-- Stats -->
+    <div class="card">
+      <div class="card-header">Statistics</div>
+      <div class="stat-row"><span class="stat-label">Uptime</span><span id="uptime">-</span></div>
+      <div class="stat-row"><span class="stat-label">Failovers</span><span id="failovers">0</span></div>
+      <div class="stat-row"><span class="stat-label">Total Sessions</span><span id="totalSessions">0</span></div>
+    </div>
+  </div>
+  <!-- Active sessions table -->
+  <div class="card card-wide">
+    <div class="card-header">Active Tunnels</div>
+    <table class="tbl">
+      <thead><tr><th>CH</th><th>Client</th><th>Type</th><th>Backend</th><th>Uptime</th><th>Telegrams</th><th>Status</th></tr></thead>
+      <tbody id="dashSessionsBody"><tr><td colspan="7" class="empty">No active sessions</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Configuration ─────────────────────────────────────────── -->
+<div id="page-config" class="page">
+  <h2 class="page-title">Configuration</h2>
+
+  <!-- Primary Interface -->
+  <div class="form-section">
+    <div class="form-header" onclick="toggleSection(this)">
+      <h3>🔵 Primary Interface</h3><span class="arrow">▾</span>
+    </div>
+    <div class="form-body open">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Host / IP</label>
+          <input type="text" id="cfg-primary_host" placeholder="e.g. 192.168.1.10">
+        </div>
+        <div class="form-group">
+          <label>Port</label>
+          <input type="number" id="cfg-primary_port" value="3671" min="1" max="65535">
+        </div>
+        <div class="form-group">
+          <label>Protocol</label>
+          <select id="cfg-primary_protocol">
+            <option value="tcp">TCP</option>
+            <option value="udp">UDP</option>
+            <option value="auto">Auto-detect</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>KNX IP Secure</label>
+          <input type="checkbox" id="cfg-primary_secure" onchange="toggleSecure('primary')">
+          <span class="help">Enable encrypted tunneling (requires gateway support)</span>
+        </div>
+      </div>
+      <div class="secure-fields" id="primary-secure-fields">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Device Password</label>
+            <input type="password" id="cfg-primary_device_password" placeholder="Device authentication code">
+          </div>
+          <div class="form-group">
+            <label>User Password</label>
+            <input type="password" id="cfg-primary_user_password" placeholder="User password for tunneling">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Backup Interface -->
+  <div class="form-section">
+    <div class="form-header" onclick="toggleSection(this)">
+      <h3>🟡 Backup Interface</h3><span class="arrow">▾</span>
+    </div>
+    <div class="form-body open">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Host / IP</label>
+          <input type="text" id="cfg-backup_host" placeholder="e.g. 192.168.1.11">
+        </div>
+        <div class="form-group">
+          <label>Port</label>
+          <input type="number" id="cfg-backup_port" value="3671" min="1" max="65535">
+        </div>
+        <div class="form-group">
+          <label>Protocol</label>
+          <select id="cfg-backup_protocol">
+            <option value="tcp">TCP</option>
+            <option value="udp" selected>UDP</option>
+            <option value="auto">Auto-detect</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>KNX IP Secure</label>
+          <input type="checkbox" id="cfg-backup_secure" onchange="toggleSecure('backup')">
+        </div>
+      </div>
+      <div class="secure-fields" id="backup-secure-fields">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Device Password</label>
+            <input type="password" id="cfg-backup_device_password">
+          </div>
+          <div class="form-group">
+            <label>User Password</label>
+            <input type="password" id="cfg-backup_user_password">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- USB Interface -->
+  <div class="form-section">
+    <div class="form-header" onclick="toggleSection(this)">
+      <h3>🟢 USB Interface</h3><span class="arrow">▾</span>
+    </div>
+    <div class="form-body open">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>USB Device</label>
+          <div style="display:flex;gap:8px">
+            <input type="text" id="cfg-usb_device" placeholder="/dev/bus/usb/… or auto" style="flex:1">
+            <button class="btn btn-sm" onclick="scanAndFillUSB()">Scan</button>
+          </div>
+          <span class="help">Enter path, "auto" for auto-discovery, or leave empty to disable</span>
+        </div>
+        <div class="form-group">
+          <label>Baud Rate</label>
+          <input type="number" id="cfg-usb_baud" value="19200">
+        </div>
+        <div class="form-group">
+          <label>USB Mode</label>
+          <select id="cfg-usb_mode">
+            <option value="auto">Auto (knxd → native → socat)</option>
+            <option value="knxd">knxd daemon</option>
+            <option value="native">Native USB (pyusb)</option>
+            <option value="socat">socat bridge</option>
+          </select>
+          <span class="help">How to bridge USB device to KNXnet/IP</span>
+        </div>
+        <div class="form-group">
+          <label>USB Priority</label>
+          <select id="cfg-usb_priority">
+            <option value="last_resort">Last Resort (after IP interfaces fail)</option>
+            <option value="prefer">Prefer (use USB first)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Extra knxd Args</label>
+          <input type="text" id="cfg-usb_knxd_extra_args" placeholder="Additional knxd arguments">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- External knxd -->
+  <div class="form-section">
+    <div class="form-header" onclick="toggleSection(this)">
+      <h3>🟣 External knxd</h3><span class="arrow">▾</span>
+    </div>
+    <div class="form-body">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>knxd Host</label>
+          <input type="text" id="cfg-knxd_host" placeholder="Leave empty to disable">
+        </div>
+        <div class="form-group">
+          <label>knxd Port</label>
+          <input type="number" id="cfg-knxd_port" value="3671">
+        </div>
+        <div class="form-group">
+          <label>Protocol</label>
+          <select id="cfg-knxd_protocol">
+            <option value="udp">UDP</option>
+            <option value="tcp">TCP</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Frontend Settings -->
+  <div class="form-section">
+    <div class="form-header" onclick="toggleSection(this)">
+      <h3>🌐 Frontend (HA Connection)</h3><span class="arrow">▾</span>
+    </div>
+    <div class="form-body open">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Frontend Protocol</label>
+          <select id="cfg-frontend_protocol">
+            <option value="udp">UDP (recommended)</option>
+            <option value="tcp">TCP</option>
+            <option value="both">Both TCP + UDP</option>
+          </select>
+          <span class="help">Protocol HA/xknx uses to connect to this proxy</span>
+        </div>
+        <div class="form-group">
+          <label>Listen Port</label>
+          <input type="number" id="cfg-listen_port" value="3671" min="1" max="65535">
+          <span class="help">Changing this requires add-on restart</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Failover Settings -->
+  <div class="form-section">
+    <div class="form-header" onclick="toggleSection(this)">
+      <h3>🔄 Failover &amp; Health</h3><span class="arrow">▾</span>
+    </div>
+    <div class="form-body">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Failback Mode</label>
+          <select id="cfg-failback_mode">
+            <option value="auto">Auto (return to primary when recovered)</option>
+            <option value="manual">Manual (restart to return)</option>
+            <option value="disabled">Disabled (stay on backup)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Failback Delay (seconds)</label>
+          <input type="number" id="cfg-failback_delay_seconds" value="30" min="1">
+          <span class="help">Wait this long before failing back to primary</span>
+        </div>
+        <div class="form-group">
+          <label>Health Check Interval (s)</label>
+          <input type="number" id="cfg-health_check_interval" value="5" min="1">
+        </div>
+        <div class="form-group">
+          <label>Failure Threshold</label>
+          <input type="number" id="cfg-health_check_fall" value="3" min="1">
+          <span class="help">Consecutive failures before failover</span>
+        </div>
+        <div class="form-group">
+          <label>Recovery Threshold</label>
+          <input type="number" id="cfg-health_check_rise" value="2" min="1">
+          <span class="help">Consecutive successes before failback</span>
+        </div>
+        <div class="form-group">
+          <label>Health Check Method</label>
+          <select id="cfg-health_check_method">
+            <option value="probe">Probe (DESCRIPTION_REQUEST)</option>
+            <option value="heartbeat">Heartbeat</option>
+            <option value="both">Both</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Connection Timeout (s)</label>
+          <input type="number" id="cfg-connection_timeout" value="5" min="1">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Session Settings -->
+  <div class="form-section">
+    <div class="form-header" onclick="toggleSection(this)">
+      <h3>📡 Session Management</h3><span class="arrow">▾</span>
+    </div>
+    <div class="form-body">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Max Sessions</label>
+          <input type="number" id="cfg-max_sessions" value="8" min="1" max="16">
+          <span class="help">Maximum concurrent tunnel sessions (HA + ETS)</span>
+        </div>
+        <div class="form-group">
+          <label>Session Timeout (s)</label>
+          <input type="number" id="cfg-session_timeout" value="120" min="30">
+          <span class="help">Close sessions idle longer than this</span>
+        </div>
+        <div class="form-group">
+          <label>Drain Timeout (s)</label>
+          <input type="number" id="cfg-drain_timeout_seconds" value="5" min="1" max="30">
+          <span class="help">Max wait during graceful session drain on failover</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Advanced -->
+  <div class="form-section">
+    <div class="form-header" onclick="toggleSection(this)">
+      <h3>⚙️ Advanced</h3><span class="arrow">▾</span>
+    </div>
+    <div class="form-body">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Log Level</label>
+          <select id="cfg-log_level">
+            <option value="debug">Debug</option>
+            <option value="info" selected>Info</option>
+            <option value="warning">Warning</option>
+            <option value="error">Error</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Notify on Failover</label>
+          <input type="checkbox" id="cfg-notify_on_failover">
+          <span class="help">Send HA persistent notification on failover events</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="btn-group">
+    <button class="btn btn-primary" onclick="saveConfig()">💾 Save Configuration</button>
+    <button class="btn" onclick="App.reload()">🔄 Reload Backend</button>
+    <button class="btn btn-danger" onclick="restartAddon()">⚡ Restart Add-on</button>
+  </div>
+</div>
+
+<!-- ── Devices ────────────────────────────────────────────────── -->
+<div id="page-devices" class="page">
+  <h2 class="page-title">Devices</h2>
+  <div class="card card-wide">
+    <div class="card-header">
+      USB KNX Interfaces
+      <button class="btn btn-sm btn-primary" onclick="App.discoverUSB()">🔍 Scan USB</button>
+    </div>
+    <div id="usbDeviceList">
+      <p style="color:var(--text2);padding:16px 0;text-align:center">
+        Click <strong>Scan USB</strong> to discover connected KNX USB interfaces
+      </p>
+    </div>
+  </div>
+  <div class="card card-wide" style="margin-top:16px">
+    <div class="card-header">Network Backend Probe</div>
+    <div class="form-grid" style="padding:4px 0">
+      <div class="form-group">
+        <label>Host</label>
+        <input type="text" id="probe-host" placeholder="192.168.1.10">
+      </div>
+      <div class="form-group">
+        <label>Port</label>
+        <input type="number" id="probe-port" value="3671">
+      </div>
+      <div class="form-group" style="justify-content:flex-end">
+        <button class="btn btn-sm" onclick="probeHost()">Test Connection</button>
+      </div>
+    </div>
+    <div id="probeResult"></div>
+  </div>
+</div>
+
+<!-- ── Sessions ───────────────────────────────────────────────── -->
+<div id="page-sessions" class="page">
+  <h2 class="page-title">Active Sessions</h2>
+  <div class="card card-wide">
+    <div class="card-header">
+      Tunnel Sessions
+      <span id="sessRefresh" style="font-size:.78rem;color:var(--text2)">Auto-refresh 3s</span>
+    </div>
+    <table class="tbl">
+      <thead><tr>
+        <th>Channel</th><th>Client Address</th><th>Type</th>
+        <th>Backend</th><th>Uptime</th><th>Bytes In</th><th>Bytes Out</th>
+        <th>Telegrams</th><th>Errors</th><th>Status</th>
+      </tr></thead>
+      <tbody id="sessionsFullBody"><tr><td colspan="10" class="empty">No active sessions</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+</div><!-- .main -->
+
+<!-- Toast container -->
+<div class="toast-container" id="toasts"></div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════ */
+/* KNX Failover Proxy — Web UI Application                          */
+/* ═══════════════════════════════════════════════════════════════════ */
+const App = {
+  state: {},
+  config: {},
+  _timer: null,
+
+  /* ── Init ────────────────────────────────────────────────────── */
+  init() {
+    this.setupNav();
+    this.loadConfig();
+    this.refreshStatus();
+    this._timer = setInterval(() => this.refreshStatus(), 3000);
+  },
+
+  /* ── Navigation ──────────────────────────────────────────────── */
+  setupNav() {
+    document.querySelectorAll('.nav-item').forEach(el => {
+      el.addEventListener('click', e => {
+        e.preventDefault();
+        const page = el.dataset.page;
+        document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+        el.classList.add('active');
+        document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+        const target = document.getElementById('page-' + page);
+        if (target) target.classList.add('active');
+      });
+    });
+  },
+
+  /* ── API calls ───────────────────────────────────────────────── */
+  async api(path, opts) {
+    try {
+      const r = await fetch('api/' + path, opts);
+      return await r.json();
+    } catch (e) {
+      console.error('API error:', path, e);
+      return null;
+    }
+  },
+
+  /* ── Status refresh ──────────────────────────────────────────── */
+  async refreshStatus() {
+    const data = await this.api('status');
+    if (!data) return;
+    this.state = data;
+    this.renderDashboard(data);
+    this.renderSessions(data.sessions || []);
+  },
+
+  renderDashboard(d) {
+    const stateMap = {
+      'PRIMARY':  { color: 'green',  label: 'Primary Active',   desc: '' },
+      'BACKUP':   { color: 'orange', label: 'Backup Active',    desc: 'Primary interface unreachable' },
+      'USB':      { color: 'blue',   label: 'USB Active',       desc: 'IP interfaces down, using USB' },
+      'KNXD':     { color: 'purple', label: 'knxd Active',      desc: 'Using external knxd' },
+      'DEGRADED': { color: 'red',    label: 'Degraded',         desc: 'No backends available — retrying' },
+    };
+    const s = stateMap[d.state] || { color: 'red', label: d.state || 'Unknown', desc: '' };
+    const dot = document.getElementById('statusDot');
+    dot.className = 'status-dot ' + s.color;
+    document.getElementById('stateName').textContent = s.label;
+
+    let descText = s.desc;
+    if (d.backend) {
+      descText = d.backend.host + ':' + d.backend.port + ' [' + d.backend.protocol.toUpperCase() + ']';
+    }
+    document.getElementById('stateDesc').textContent = descText || 'No backend';
+
+    // Backend info card
+    const bi = document.getElementById('backendInfo');
+    if (d.backend) {
+      bi.innerHTML = '<div style="font-weight:600">' + esc(d.backend.host) + ':' + d.backend.port + '</div>'
+        + '<div style="color:var(--text2);font-size:.85rem;margin-top:4px">'
+        + '<span class="badge badge-' + (d.backend.protocol === 'tcp' ? 'blue' : 'green') + '">'
+        + d.backend.protocol.toUpperCase() + '</span></div>';
+    } else {
+      bi.innerHTML = '<span style="color:var(--text2)">No backend configured</span>';
+    }
+
+    document.getElementById('sessionCount').textContent = d.active_sessions;
+    document.getElementById('sessionMax').textContent = d.max_sessions;
+    document.getElementById('uptime').textContent = fmtUptime(d.uptime_s);
+    document.getElementById('failovers').textContent = d.total_failovers;
+    document.getElementById('totalSessions').textContent = d.total_sessions;
+
+    // Dashboard sessions table (compact)
+    const tbody = document.getElementById('dashSessionsBody');
+    const sessions = d.sessions || [];
+    if (sessions.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No active sessions</td></tr>';
+    } else {
+      tbody.innerHTML = sessions.map(s =>
+        '<tr><td>' + s.channel_id + '</td>'
+        + '<td>' + esc(s.client_addr) + '</td>'
+        + '<td><span class="badge badge-' + (s.client_type === 'tcp' ? 'blue' : 'green') + '">'
+        + (s.client_type||'').toUpperCase() + '</span></td>'
+        + '<td>' + esc(s.backend_addr) + '</td>'
+        + '<td>' + fmtUptime(s.uptime_s) + '</td>'
+        + '<td>' + s.telegrams + '</td>'
+        + '<td>' + (s.draining ? '<span class="badge badge-orange">Draining</span>'
+        : '<span class="badge badge-green">Active</span>') + '</td></tr>'
+      ).join('');
+    }
+  },
+
+  renderSessions(sessions) {
+    const tbody = document.getElementById('sessionsFullBody');
+    if (!sessions.length) {
+      tbody.innerHTML = '<tr><td colspan="10" class="empty">No active sessions</td></tr>';
+      return;
+    }
+    tbody.innerHTML = sessions.map(s =>
+      '<tr><td>' + s.channel_id + '</td>'
+      + '<td>' + esc(s.client_addr) + '</td>'
+      + '<td><span class="badge badge-' + (s.client_type === 'tcp' ? 'blue' : 'green') + '">'
+      + (s.client_type||'').toUpperCase() + '</span></td>'
+      + '<td>' + esc(s.backend_addr) + ' <span class="badge badge-'
+      + (s.backend_type === 'tcp' ? 'blue' : 'green') + '">'
+      + (s.backend_type||'').toUpperCase() + '</span></td>'
+      + '<td>' + fmtUptime(s.uptime_s) + '</td>'
+      + '<td>' + fmtBytes(s.bytes_in) + '</td>'
+      + '<td>' + fmtBytes(s.bytes_out) + '</td>'
+      + '<td>' + s.telegrams + '</td>'
+      + '<td>' + (s.errors || 0) + '</td>'
+      + '<td>' + (s.draining ? '<span class="badge badge-orange">Draining</span>'
+      : '<span class="badge badge-green">Active</span>') + '</td></tr>'
+    ).join('');
+  },
+
+  /* ── Config ──────────────────────────────────────────────────── */
+  async loadConfig() {
+    const data = await this.api('config');
+    if (!data || data.error) return;
+    this.config = data;
+    this.fillConfigForm(data);
+  },
+
+  fillConfigForm(cfg) {
+    const fields = [
+      'primary_host','primary_port','primary_protocol','primary_secure',
+      'primary_device_password','primary_user_password',
+      'backup_host','backup_port','backup_protocol','backup_secure',
+      'backup_device_password','backup_user_password',
+      'usb_device','usb_baud','usb_mode','usb_priority','usb_knxd_extra_args',
+      'knxd_host','knxd_port','knxd_protocol',
+      'frontend_protocol','listen_port',
+      'failback_mode','failback_delay_seconds',
+      'health_check_interval','health_check_fall','health_check_rise',
+      'health_check_method','connection_timeout',
+      'max_sessions','session_timeout','drain_timeout_seconds',
+      'log_level','notify_on_failover',
+    ];
+    fields.forEach(f => {
+      const el = document.getElementById('cfg-' + f);
+      if (!el) return;
+      const val = cfg[f];
+      if (val === undefined || val === null) return;
+      if (el.type === 'checkbox') {
+        el.checked = val === true || val === 'true';
+      } else {
+        el.value = val;
+      }
+    });
+    // Toggle secure field visibility
+    toggleSecure('primary');
+    toggleSecure('backup');
+  },
+
+  collectConfig() {
+    const cfg = {};
+    document.querySelectorAll('[id^="cfg-"]').forEach(el => {
+      const key = el.id.replace('cfg-', '');
+      if (el.type === 'checkbox') {
+        cfg[key] = el.checked;
+      } else if (el.type === 'number') {
+        cfg[key] = el.value ? parseInt(el.value, 10) : '';
+      } else {
+        cfg[key] = el.value;
+      }
+    });
+    return cfg;
+  },
+
+  /* ── USB discovery ───────────────────────────────────────────── */
+  async discoverUSB() {
+    const container = document.getElementById('usbDeviceList');
+    container.innerHTML = '<p style="color:var(--text2);padding:16px;text-align:center">Scanning USB bus…</p>';
+    const data = await this.api('usb');
+    if (!data) {
+      container.innerHTML = '<p style="color:var(--red);padding:16px;text-align:center">Scan failed</p>';
+      return;
+    }
+    if (!data.devices || data.devices.length === 0) {
+      container.innerHTML = '<p style="color:var(--text2);padding:16px;text-align:center">'
+        + 'No KNX USB devices found' + (data.error ? '<br><small>' + esc(data.error) + '</small>' : '') + '</p>';
+      return;
+    }
+    container.innerHTML = '<div class="device-list">'
+      + data.devices.map(d =>
+        '<div class="device-card">'
+        + '<div class="device-icon"><svg viewBox="0 0 24 24"><path d="M15 7v4h1v2h-3V5h2l-3-4-3 4h2v8H8v-2.07c.7-.37 1.2-1.08 1.2-1.93 0-1.21-.99-2.2-2.2-2.2-1.21 0-2.2.99-2.2 2.2 0 .85.5 1.56 1.2 1.93V13c0 1.11.89 2 2 2h3v3.05c-.71.37-1.2 1.1-1.2 1.95a2.2 2.2 0 004.4 0c0-.85-.49-1.58-1.2-1.95V15h3c1.11 0 2-.89 2-2v-2h1V7h-4z"/></svg></div>'
+        + '<div class="device-info">'
+        + '<strong>' + esc(d.vendor || 'Unknown') + ' ' + esc(d.product || 'Device') + '</strong>'
+        + '<span>Path: ' + esc(d.path) + '</span>'
+        + (d.serial ? '<span> · Serial: ' + esc(d.serial) + '</span>' : '')
+        + '<span> · VID:PID ' + esc(d.vendor_id || '') + ':' + esc(d.product_id || '') + '</span>'
+        + '</div>'
+        + '<button class="btn btn-sm" onclick="useDevice(\'' + esc(d.path) + '\')">Use</button>'
+        + '</div>'
+      ).join('') + '</div>';
+  },
+
+  /* ── Actions ─────────────────────────────────────────────────── */
+  async reload() {
+    const data = await this.api('reload', {method: 'POST'});
+    if (data && data.ok) toast('Backend reload signal sent', 'success');
+    else toast('Reload failed: ' + (data?.error || 'unknown'), 'error');
+  },
+};
+
+/* ── Helper functions ───────────────────────────────────────────── */
+function esc(s) {
+  if (s == null) return '';
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+function fmtUptime(sec) {
+  if (!sec && sec !== 0) return '-';
+  sec = Math.round(sec);
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec/60) + 'm ' + (sec%60) + 's';
+  const h = Math.floor(sec/3600);
+  const m = Math.floor((sec%3600)/60);
+  return h + 'h ' + m + 'm';
+}
+function fmtBytes(b) {
+  if (!b) return '0';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(1) + ' MB';
+}
+function toast(msg, type) {
+  const c = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast toast-' + (type || 'info');
+  el.textContent = msg;
+  c.appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+/* ── Form helpers ───────────────────────────────────────────────── */
+function toggleSection(header) {
+  const body = header.nextElementSibling;
+  const arrow = header.querySelector('.arrow');
+  body.classList.toggle('open');
+  arrow.classList.toggle('open');
+}
+function toggleSecure(prefix) {
+  const cb = document.getElementById('cfg-' + prefix + '_secure');
+  const fields = document.getElementById(prefix + '-secure-fields');
+  if (cb && fields) {
+    fields.classList.toggle('visible', cb.checked);
+  }
+}
+function useDevice(path) {
+  document.getElementById('cfg-usb_device').value = path;
+  document.querySelectorAll('.nav-item')[1].click(); // switch to config
+  toast('USB device path copied to configuration', 'success');
+}
+async function scanAndFillUSB() {
+  const data = await App.api('usb');
+  if (data && data.devices && data.devices.length > 0) {
+    document.getElementById('cfg-usb_device').value = data.devices[0].path;
+    toast('Found: ' + data.devices[0].vendor + ' ' + data.devices[0].product, 'success');
+  } else {
+    toast('No KNX USB devices found', 'error');
+  }
+}
+async function saveConfig() {
+  const cfg = App.collectConfig();
+  const data = await App.api('config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(cfg),
+  });
+  if (data && data.ok) {
+    toast('Configuration saved successfully', 'success');
+    App.config = cfg;
+  } else {
+    toast('Save failed: ' + (data?.error || 'unknown error'), 'error');
+  }
+}
+async function restartAddon() {
+  if (!confirm('Restart the add-on? Active tunnel sessions will be interrupted.')) return;
+  const data = await App.api('restart', {method: 'POST'});
+  if (data && data.ok) toast('Add-on restart initiated — page will reload shortly', 'info');
+  else toast('Restart failed: ' + (data?.error || 'unknown'), 'error');
+}
+async function probeHost() {
+  const host = document.getElementById('probe-host').value.trim();
+  const port = parseInt(document.getElementById('probe-port').value) || 3671;
+  const div = document.getElementById('probeResult');
+  if (!host) { toast('Enter a host to probe', 'error'); return; }
+  div.innerHTML = '<p style="color:var(--text2);padding:8px 0">Probing ' + esc(host) + ':' + port + '…</p>';
+  const data = await App.api('health', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({host, port}),
+  });
+  if (!data) { div.innerHTML = '<p style="color:var(--red)">Probe failed</p>'; return; }
+  if (data.reachable) {
+    div.innerHTML = '<p style="padding:8px 0"><span class="badge badge-green">Reachable</span> '
+      + esc(host) + ':' + port + ' via <strong>' + esc(data.protocol).toUpperCase() + '</strong></p>';
+  } else {
+    div.innerHTML = '<p style="padding:8px 0"><span class="badge badge-red">Unreachable</span> '
+      + esc(host) + ':' + port + '</p>';
+  }
+}
+
+/* ── Boot ───────────────────────────────────────────────────────── */
+document.addEventListener('DOMContentLoaded', () => App.init());
+</script>
+</body>
+</html>

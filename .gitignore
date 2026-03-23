@@ -24,7 +24,6 @@ env/
 homeassistant.log
 configuration.yaml
 secrets.yaml
-www/
 deps/
 tts/
 
