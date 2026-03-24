@@ -11,7 +11,7 @@ log()  { echo "[cont-init] $*"; }
 warn() { echo "[cont-init] WARN: $*"; }
 fail() { echo "[cont-init] FATAL: $*" >&2; exit 1; }
 
-log "KNX Failover Proxy v4.2.0 — pre-flight checks"
+log "KNX Failover Proxy v4.2.2 — pre-flight checks"
 
 # ---------------------------------------------------------------------------
 # 1. Verify options file exists and is valid JSON
