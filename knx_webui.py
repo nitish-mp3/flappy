@@ -27,7 +27,7 @@ STATE_FILE = "/run/knx-failover.state"
 METRICS_FILE = "/run/knx-metrics.json"
 BACKEND_FILE = "/run/knx-active-backend"
 WWW_DIR = "/www"
-VERSION = "4.2.2"
+VERSION = "4.2.3"
 
 SUPERVISOR_TOKEN = os.environ.get('SUPERVISOR_TOKEN', '')
 
@@ -156,14 +156,41 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             if not isinstance(updates, dict):
                 self._json({'error': 'Expected JSON object'}, 400)
                 return
+
+            # Read current options
             with open(OPTIONS_FILE, 'r', encoding='utf-8') as f:
                 current = json.load(f)
             current.update(updates)
+
+            # Write locally for immediate effect (current run)
             tmp = OPTIONS_FILE + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(current, f, indent=2)
             os.replace(tmp, OPTIONS_FILE)
-            self._json({'ok': True, 'message': 'Configuration saved'})
+
+            # Persist via HA Supervisor API so changes survive restart
+            persisted = False
+            if SUPERVISOR_TOKEN:
+                try:
+                    import urllib.request
+                    req = urllib.request.Request(
+                        'http://supervisor/addons/self/options',
+                        method='POST',
+                        data=json.dumps({'options': current}).encode(),
+                        headers={
+                            'Authorization': f'Bearer {SUPERVISOR_TOKEN}',
+                            'Content-Type': 'application/json',
+                        },
+                    )
+                    urllib.request.urlopen(req, timeout=10)
+                    persisted = True
+                except Exception as e:
+                    log.warning(f"Supervisor options save failed: {e}")
+
+            msg = 'Configuration saved'
+            if not persisted:
+                msg += ' (runtime only — restart may revert changes)'
+            self._json({'ok': True, 'message': msg, 'persisted': persisted})
         except json.JSONDecodeError:
             self._json({'error': 'Invalid JSON'}, 400)
         except Exception as e:
@@ -387,11 +414,14 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             if not (1 <= port <= 65535):
                 self._json({'error': 'Invalid port'}, 400)
                 return
+            # Pass host/port as args (not string-interpolated) to avoid injection
+            probe_script = (
+                "import sys; sys.path.insert(0,'/'); "
+                "from knx_health import detect_protocol; "
+                "print(detect_protocol(sys.argv[1],int(sys.argv[2]),'tcp',5))"
+            )
             result = subprocess.run(
-                ['python3', '-c',
-                 f"import sys; sys.path.insert(0,'/'); "
-                 f"from knx_health import detect_protocol; "
-                 f"print(detect_protocol('{host}',{port},'tcp',5))"],
+                ['python3', '-c', probe_script, host, str(port)],
                 capture_output=True, text=True, timeout=15,
             )
             proto = result.stdout.strip()

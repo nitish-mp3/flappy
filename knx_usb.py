@@ -289,22 +289,38 @@ class KNXUSBTransport:
                 log.error(f"USB device not found: {self.device_path}")
                 return False
 
-            # Detach kernel driver if active
+            # Reset the device first to release any stale claims
             try:
-                if self.dev.is_kernel_driver_active(0):
-                    self.dev.detach_kernel_driver(0)
-                    log.debug("Detached kernel driver")
-            except (usb.core.USBError, NotImplementedError):
-                pass
+                self.dev.reset()
+                log.debug("USB device reset")
+            except (usb.core.USBError, NotImplementedError) as e:
+                log.debug(f"USB reset skipped: {e}")
 
-            # Set configuration
+            # Detach kernel drivers from ALL interfaces (not just 0)
+            # The HID driver (usbhid) may be bound to any interface
             try:
-                self.dev.set_configuration()
+                cfg = self.dev.get_active_configuration()
+                if cfg is None:
+                    self.dev.set_configuration()
+                    cfg = self.dev.get_active_configuration()
             except usb.core.USBError:
-                pass  # May already be configured
+                try:
+                    self.dev.set_configuration()
+                    cfg = self.dev.get_active_configuration()
+                except usb.core.USBError as e:
+                    log.error(f"Cannot configure USB device: {e}")
+                    return False
+
+            for intf in cfg:
+                intf_num = intf.bInterfaceNumber
+                try:
+                    if self.dev.is_kernel_driver_active(intf_num):
+                        self.dev.detach_kernel_driver(intf_num)
+                        log.debug(f"Detached kernel driver from interface {intf_num}")
+                except (usb.core.USBError, NotImplementedError) as e:
+                    log.debug(f"Could not detach kernel driver from interface {intf_num}: {e}")
 
             # Find HID interface and endpoints
-            cfg = self.dev.get_active_configuration()
             for intf in cfg:
                 if intf.bInterfaceClass == 0x03:  # HID class
                     self.interface = intf
@@ -318,7 +334,7 @@ class KNXUSBTransport:
             try:
                 usb.util.claim_interface(self.dev, self.interface)
             except usb.core.USBError as e:
-                log.error(f"Cannot claim interface: {e}")
+                log.error(f"Cannot claim interface {self.interface.bInterfaceNumber}: {e}")
                 return False
 
             # Find IN and OUT endpoints
@@ -343,11 +359,17 @@ class KNXUSBTransport:
             return False
 
     def close(self):
-        """Close the USB device."""
+        """Close the USB device and re-attach kernel drivers."""
         self.running = False
         if self.dev and self.interface:
+            intf_num = self.interface.bInterfaceNumber
             try:
                 usb.util.release_interface(self.dev, self.interface)
+            except Exception:
+                pass
+            # Re-attach kernel driver so the device is usable again
+            try:
+                self.dev.attach_kernel_driver(intf_num)
             except Exception:
                 pass
             try:

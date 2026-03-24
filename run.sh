@@ -22,7 +22,7 @@ readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly WEBUI_PID_FILE="/run/knx-webui.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="4.2.2"
+readonly VERSION="4.2.3"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -60,6 +60,8 @@ USB_LOCAL_PORT=13671
 NATIVE_USB_PID=""
 WEBUI_PID=""
 readonly NATIVE_USB_PID_FILE="/run/knx-usb-bridge.pid"
+USB_BRIDGE_FAIL_COUNT=0
+USB_BRIDGE_FAIL_TS=0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -609,8 +611,15 @@ enter_usb() {
         set_backend "127.0.0.1" "$USB_LOCAL_PORT" "$usb_proto"
         reload_proxy
         write_state
+        USB_BRIDGE_FAIL_COUNT=0
+        USB_BRIDGE_FAIL_TS=0
         ha_notify "Failover to USB" "Both IP interfaces down. Using USB ${USB_DEVICE}."
     else
+        USB_BRIDGE_FAIL_COUNT=$((USB_BRIDGE_FAIL_COUNT + 1))
+        USB_BRIDGE_FAIL_TS="$(date +%s)"
+        local cooldown=$(( USB_BRIDGE_FAIL_COUNT * 15 ))
+        [[ $cooldown -gt 120 ]] && cooldown=120
+        log_warn "USB bridge failed (attempt ${USB_BRIDGE_FAIL_COUNT}, retry in ${cooldown}s)"
         enter_degraded "usb-bridge-start-failed"
     fi; return 0
 }
@@ -891,7 +900,23 @@ tick_degraded() {
 
     # Try USB
     if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
-        log_notice "USB available"; enter_usb; return 0; fi
+        # Check USB bridge cooldown (exponential backoff after failures)
+        if [[ "$USB_BRIDGE_FAIL_COUNT" -gt 0 ]] && [[ "$USB_BRIDGE_FAIL_TS" -gt 0 ]]; then
+            local now cooldown elapsed
+            now="$(date +%s)"
+            cooldown=$(( USB_BRIDGE_FAIL_COUNT * 15 ))
+            [[ $cooldown -gt 120 ]] && cooldown=120
+            elapsed=$(( now - USB_BRIDGE_FAIL_TS ))
+            if [[ "$elapsed" -lt "$cooldown" ]]; then
+                local remain=$(( cooldown - elapsed ))
+                log_debug "USB bridge in cooldown (${remain}s remaining after ${USB_BRIDGE_FAIL_COUNT} failures)"
+            else
+                log_notice "USB available (cooldown expired)"; enter_usb; return 0
+            fi
+        else
+            log_notice "USB available"; enter_usb; return 0
+        fi
+    fi
 
     log_debug "All interfaces still down — retrying in ${CHECK_INTERVAL}s"; return 0
 }

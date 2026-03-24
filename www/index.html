@@ -205,7 +205,7 @@ input,select,textarea{font-family:var(--font);font-size:.93rem}
   </nav>
   <div class="sidebar-footer">
     <div>KNX Failover Proxy</div>
-    <div id="sidebarVersion">v4.2.2</div>
+    <div id="sidebarVersion">v4.2.3</div>
   </div>
 </aside>
 
@@ -987,7 +987,9 @@ function toggleSecure(prefix) {
 function useDevice(path) {
   document.getElementById('cfg-usb_device').value = path;
   document.querySelectorAll('.nav-item')[1].click(); // switch to config
-  toast('USB device path copied to configuration', 'success');
+  toast('USB device path set — saving configuration...', 'info');
+  // Auto-save so the device path persists across restarts
+  setTimeout(() => saveConfig(), 300);
 }
 async function scanAndFillUSB() {
   const data = await App.api('usb');
@@ -1006,8 +1008,12 @@ async function saveConfig() {
     body: JSON.stringify(cfg),
   });
   if (data && data.ok) {
-    toast('Configuration saved successfully', 'success');
     App.config = cfg;
+    if (data.persisted) {
+      toast('Configuration saved — changes will persist across restarts', 'success');
+    } else {
+      toast('Configuration saved for this session. Changes may not persist after restart — update the add-on Configuration tab in HA to make permanent.', 'info');
+    }
   } else {
     toast('Save failed: ' + (data?.error || 'unknown error'), 'error');
   }

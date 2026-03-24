@@ -5,7 +5,7 @@ description: >
   KNX/IP failover proxy with instant hot-failover,
   KNX IP Secure tunneling, USB via knxd, and configurable failback.
   Supports TCP, UDP, and USB interfaces in any combination.
-version: "4.2.2"
+version: "4.2.3"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -137,10 +137,12 @@ schema:
 
 # ─── Permissions ──────────────────────────────────────────────────────
 privileged: []
+hassio_api: true
+auth_api: false
 uart: true
 udev: true
 usb: true
-access_token: false
+access_token: true
 devices: []
 realtime: false
 init: false
