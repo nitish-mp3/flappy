@@ -142,7 +142,6 @@ auth_api: false
 uart: true
 udev: true
 usb: true
-access_token: true
 devices: []
 realtime: false
 init: false
