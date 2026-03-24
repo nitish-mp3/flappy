@@ -27,7 +27,7 @@ STATE_FILE = "/run/knx-failover.state"
 METRICS_FILE = "/run/knx-metrics.json"
 BACKEND_FILE = "/run/knx-active-backend"
 WWW_DIR = "/www"
-VERSION = "4.2.0"
+VERSION = "4.2.1"
 
 SUPERVISOR_TOKEN = os.environ.get('SUPERVISOR_TOKEN', '')
 
@@ -88,6 +88,8 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             self._api_metrics()
         elif path == '/api/usb':
             self._api_usb_discover()
+        elif path == '/api/interfaces':
+            self._api_interfaces()
         elif path == '/api/version':
             self._json({'version': VERSION})
         else:
@@ -194,6 +196,143 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self._json({'devices': [], 'count': 0, 'error': str(e)})
 
+    def _api_interfaces(self):
+        """Return status of all configured interfaces (primary, backup, knxd, USB)."""
+        try:
+            cfg = {}
+            try:
+                with open(OPTIONS_FILE, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+
+            state = _read_state_file()
+            backend = _read_backend_file()
+            current_state = state.get('state', 'UNKNOWN')
+
+            interfaces = []
+
+            # Primary
+            ph = cfg.get('primary_host', '')
+            if ph:
+                active = (current_state == 'PRIMARY' and backend
+                          and backend.get('host') == ph)
+                interfaces.append({
+                    'name': 'Primary',
+                    'type': 'network',
+                    'host': ph,
+                    'port': cfg.get('primary_port', 3671),
+                    'protocol': cfg.get('primary_protocol', 'tcp'),
+                    'secure': cfg.get('primary_secure', False),
+                    'active': active,
+                    'status': 'active' if active else 'standby',
+                })
+            else:
+                interfaces.append({
+                    'name': 'Primary',
+                    'type': 'network',
+                    'host': '',
+                    'port': 3671,
+                    'protocol': '-',
+                    'secure': False,
+                    'active': False,
+                    'status': 'not_configured',
+                })
+
+            # Backup
+            bh = cfg.get('backup_host', '')
+            if bh:
+                active = (current_state == 'BACKUP' and backend
+                          and backend.get('host') == bh)
+                interfaces.append({
+                    'name': 'Backup',
+                    'type': 'network',
+                    'host': bh,
+                    'port': cfg.get('backup_port', 3671),
+                    'protocol': cfg.get('backup_protocol', 'udp'),
+                    'secure': cfg.get('backup_secure', False),
+                    'active': active,
+                    'status': 'active' if active else 'standby',
+                })
+            else:
+                interfaces.append({
+                    'name': 'Backup',
+                    'type': 'network',
+                    'host': '',
+                    'port': 3671,
+                    'protocol': '-',
+                    'secure': False,
+                    'active': False,
+                    'status': 'not_configured',
+                })
+
+            # knxd
+            kh = cfg.get('knxd_host', '')
+            if kh:
+                active = (current_state == 'KNXD' and backend
+                          and backend.get('host') == kh)
+                interfaces.append({
+                    'name': 'knxd',
+                    'type': 'network',
+                    'host': kh,
+                    'port': cfg.get('knxd_port', 3671),
+                    'protocol': cfg.get('knxd_protocol', 'udp'),
+                    'secure': False,
+                    'active': active,
+                    'status': 'active' if active else 'standby',
+                })
+
+            # USB
+            ud = cfg.get('usb_device', '')
+            usb_active = current_state == 'USB'
+            usb_mode = cfg.get('usb_mode', 'auto')
+            usb_status = 'not_configured'
+            usb_error = ''
+            if ud:
+                usb_status = 'active' if usb_active else 'standby'
+                # Check device existence
+                if not os.path.exists(ud):
+                    usb_status = 'device_missing'
+                    usb_error = f'Device {ud} not found'
+                else:
+                    is_raw = ud.startswith('/dev/bus/usb/') or ud.startswith('/dev/hidraw')
+                    # Check if bridge tools are available
+                    has_knxd = os.path.isfile('/usr/bin/knxd') or os.path.isfile('/usr/local/bin/knxd')
+                    has_pyusb = False
+                    try:
+                        import importlib
+                        importlib.import_module('usb.core')
+                        has_pyusb = True
+                    except Exception:
+                        pass
+                    if is_raw and not has_knxd and not has_pyusb:
+                        usb_status = 'no_driver'
+                        usb_error = ('Raw USB HID device requires knxd or pyusb. '
+                                     'Neither is installed. Rebuild the add-on.')
+                    elif usb_mode == 'socat' and is_raw:
+                        usb_status = 'incompatible'
+                        usb_error = 'socat cannot handle raw USB devices. Use native or knxd mode.'
+
+            interfaces.append({
+                'name': 'USB',
+                'type': 'usb',
+                'device': ud,
+                'mode': usb_mode,
+                'baud': cfg.get('usb_baud', 19200),
+                'priority': cfg.get('usb_priority', 'last_resort'),
+                'active': usb_active,
+                'status': usb_status,
+                'error': usb_error,
+            })
+
+            self._json({
+                'interfaces': interfaces,
+                'current_state': current_state,
+                'active_backend': backend,
+            })
+        except Exception as e:
+            self._json({'error': str(e)}, 500)
+
     def _api_reload(self):
         """Send SIGHUP to run.sh to trigger backend re-evaluation."""
         try:
@@ -240,6 +379,13 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             port = int(params.get('port', 3671))
             if not host:
                 self._json({'error': 'host is required'}, 400)
+                return
+            import re
+            if not re.match(r'^[a-zA-Z0-9._:\-]+$', host):
+                self._json({'error': 'Invalid host format'}, 400)
+                return
+            if not (1 <= port <= 65535):
+                self._json({'error': 'Invalid port'}, 400)
                 return
             result = subprocess.run(
                 ['python3', '-c',

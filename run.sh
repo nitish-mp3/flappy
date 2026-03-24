@@ -22,7 +22,7 @@ readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly WEBUI_PID_FILE="/run/knx-webui.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="4.2.0"
+readonly VERSION="4.2.1"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -390,6 +390,20 @@ start_usb_knxd() {
 start_usb_socat() {
     stop_usb_bridge
     local dev="$1" baud="$2" lport="$3"
+
+    # socat can only bridge serial/TTY devices, not raw USB HID
+    if [[ "$dev" == /dev/bus/usb/* ]] || [[ "$dev" == /dev/hidraw* ]]; then
+        log_error "socat cannot handle raw USB device ${dev}"
+        log_error "KNX USB HID interfaces require knxd or pyusb (native mode)"
+        log_error "Hint: Rebuild the add-on to install pyusb, or set usb_mode=native"
+        return 1
+    fi
+
+    if ! [[ -c "$dev" ]] || ! stty -F "$dev" 2>/dev/null; then
+        log_error "Device ${dev} is not a serial port — socat bridge cannot work"
+        return 1
+    fi
+
     log_info "Starting socat USB bridge: ${dev} @ ${baud} → UDP:${lport}"
     socat "UDP-LISTEN:${lport},fork,reuseaddr" \
           "OPEN:${dev},raw,echo=0,b${baud},crtscts=0" &
@@ -405,6 +419,9 @@ start_usb_socat() {
 
 start_usb_bridge() {
     local dev="$1"
+    local is_raw_usb=false
+    [[ "$dev" == /dev/bus/usb/* ]] || [[ "$dev" == /dev/hidraw* ]] && is_raw_usb=true
+
     # Select bridge mode based on usb_mode config
     case "$USB_MODE" in
         knxd)
@@ -426,6 +443,12 @@ start_usb_bridge() {
                 start_usb_knxd "$dev" "$USB_LOCAL_PORT"
             elif [[ "$HAS_PYUSB" == "true" ]]; then
                 start_usb_native "$dev" "$USB_LOCAL_PORT"
+            elif [[ "$is_raw_usb" == "true" ]]; then
+                log_error "Cannot bridge raw USB device ${dev} — neither knxd nor pyusb available"
+                log_error "Raw USB HID devices require knxd or pyusb for protocol translation"
+                log_error "socat only works with serial ports (/dev/ttyUSB*, /dev/ttyACM*)"
+                log_error "Hint: Rebuild the add-on image, or install a USB-serial KNX interface"
+                return 1
             else
                 start_usb_socat "$dev" "$USB_BAUD" "$USB_LOCAL_PORT"
             fi
@@ -980,8 +1003,16 @@ main() {
 
     load_config
 
-    log_info "Primary:   ${PRIMARY_HOST}:${PRIMARY_PORT} [${PRIMARY_PROTOCOL}]${PRIMARY_SECURE:+ (secure=${PRIMARY_SECURE})}"
-    log_info "Backup:    ${BACKUP_HOST}:${BACKUP_PORT} [${BACKUP_PROTOCOL}]${BACKUP_SECURE:+ (secure=${BACKUP_SECURE})}"
+    if [[ -n "$PRIMARY_HOST" ]]; then
+        log_info "Primary:   ${PRIMARY_HOST}:${PRIMARY_PORT} [${PRIMARY_PROTOCOL}]${PRIMARY_SECURE:+ (secure=${PRIMARY_SECURE})}"
+    else
+        log_info "Primary:   (not configured)"
+    fi
+    if [[ -n "$BACKUP_HOST" ]]; then
+        log_info "Backup:    ${BACKUP_HOST}:${BACKUP_PORT} [${BACKUP_PROTOCOL}]${BACKUP_SECURE:+ (secure=${BACKUP_SECURE})}"
+    else
+        log_info "Backup:    (not configured)"
+    fi
     [[ -n "$KNXD_HOST" ]] && \
         log_info "knxd Ext:  ${KNXD_HOST}:${KNXD_PORT} [${KNXD_PROTOCOL}]"
     log_info "Frontend:  ${FRONTEND_PROTOCOL} on port ${LISTEN_PORT}"

@@ -95,6 +95,8 @@ input,select,textarea{font-family:var(--font);font-size:.93rem}
 .badge-blue{background:rgba(88,166,255,.15);color:var(--accent)}
 .badge-orange{background:rgba(210,153,34,.15);color:var(--orange)}
 .badge-red{background:rgba(248,81,73,.15);color:var(--red)}
+.badge-purple{background:rgba(188,140,255,.15);color:var(--purple)}
+.badge-gray{background:rgba(139,148,158,.15);color:var(--text2)}
 
 /* ── Forms ─────────────────────────────────────────────────────── */
 .form-section{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
@@ -139,6 +141,24 @@ input,select,textarea{font-family:var(--font);font-size:.93rem}
 .device-info strong{display:block;font-size:.9rem}
 .device-info span{font-size:.8rem;color:var(--text2)}
 .device-list{display:grid;gap:10px;margin-top:14px}
+
+/* ── Interface List ────────────────────────────────────────────── */
+.iface-list{display:grid;gap:10px;margin-top:8px}
+.iface-card{background:var(--card-alt);border:1px solid var(--border);border-radius:var(--radius);
+  padding:14px 16px;display:flex;gap:14px;align-items:center}
+.iface-card.iface-active{border-color:var(--green);box-shadow:0 0 6px rgba(63,185,80,.15)}
+.iface-card.iface-error{border-color:var(--red);box-shadow:0 0 6px rgba(248,81,73,.1)}
+.iface-card.iface-warn{border-color:var(--orange);box-shadow:0 0 6px rgba(210,153,34,.1)}
+.iface-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.iface-dot.green{background:var(--green)}
+.iface-dot.orange{background:var(--orange)}
+.iface-dot.red{background:var(--red)}
+.iface-dot.gray{background:#484f58}
+.iface-body{flex:1;min-width:0}
+.iface-body .iface-title{font-weight:600;font-size:.9rem}
+.iface-body .iface-detail{font-size:.8rem;color:var(--text2);margin-top:2px}
+.iface-body .iface-error-msg{font-size:.78rem;color:var(--red);margin-top:4px}
+.iface-badge{flex-shrink:0}
 
 /* ── Toast ─────────────────────────────────────────────────────── */
 .toast-container{position:fixed;top:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px}
@@ -533,18 +553,33 @@ input,select,textarea{font-family:var(--font);font-size:.93rem}
 
 <!-- ── Devices ────────────────────────────────────────────────── -->
 <div id="page-devices" class="page">
-  <h2 class="page-title">Devices</h2>
+  <h2 class="page-title">Devices &amp; Interfaces</h2>
+
+  <!-- All Configured Interfaces -->
   <div class="card card-wide">
     <div class="card-header">
-      USB KNX Interfaces
-      <button class="btn btn-sm btn-primary" onclick="App.discoverUSB()">🔍 Scan USB</button>
+      Configured Interfaces
+      <button class="btn btn-sm" onclick="App.refreshInterfaces()">⟳ Refresh</button>
+    </div>
+    <div id="interfacesList">
+      <p style="color:var(--text2);padding:16px 0;text-align:center">Loading interfaces…</p>
+    </div>
+  </div>
+
+  <!-- USB Discovery -->
+  <div class="card card-wide" style="margin-top:16px">
+    <div class="card-header">
+      USB Device Scanner
+      <button class="btn btn-sm btn-primary" onclick="App.discoverUSB()">🔍 Scan USB Bus</button>
     </div>
     <div id="usbDeviceList">
       <p style="color:var(--text2);padding:16px 0;text-align:center">
-        Click <strong>Scan USB</strong> to discover connected KNX USB interfaces
+        Click <strong>Scan USB Bus</strong> to discover connected KNX USB interfaces
       </p>
     </div>
   </div>
+
+  <!-- Network Probe -->
   <div class="card card-wide" style="margin-top:16px">
     <div class="card-header">Network Backend Probe</div>
     <div class="form-grid" style="padding:4px 0">
@@ -602,7 +637,14 @@ const App = {
     this.setupNav();
     this.loadConfig();
     this.refreshStatus();
-    this._timer = setInterval(() => this.refreshStatus(), 3000);
+    this.refreshInterfaces();
+    this._timer = setInterval(() => {
+      this.refreshStatus();
+      // Refresh interfaces every 15s (heavier call)
+      if (Date.now() - (this._lastIfaceRefresh || 0) > 15000) {
+        this.refreshInterfaces();
+      }
+    }, 3000);
   },
 
   /* ── Navigation ──────────────────────────────────────────────── */
@@ -801,6 +843,92 @@ const App = {
         + '<button class="btn btn-sm" onclick="useDevice(\'' + esc(d.path) + '\')">Use</button>'
         + '</div>'
       ).join('') + '</div>';
+  },
+
+  /* ── Interface Status ────────────────────────────────────────── */
+  async refreshInterfaces() {
+    this._lastIfaceRefresh = Date.now();
+    const data = await this.api('interfaces');
+    if (!data || !data.interfaces) {
+      const el = document.getElementById('interfacesList');
+      if (el && el.textContent.includes('Loading')) {
+        el.innerHTML = '<p style="color:var(--text2);padding:16px 0;text-align:center">Could not load interfaces — proxy may still be starting</p>';
+      }
+      return;
+    }
+    this.renderInterfaces(data.interfaces, data.current_state);
+  },
+
+  renderInterfaces(interfaces, currentState) {
+    const container = document.getElementById('interfacesList');
+    if (!interfaces || interfaces.length === 0) {
+      container.innerHTML = '<p style="color:var(--text2);padding:16px 0;text-align:center">No interfaces configured</p>';
+      return;
+    }
+
+    const statusInfo = {
+      'active':          { dot: 'green',  badge: 'green',  label: 'Active',         icon: '●' },
+      'standby':         { dot: 'orange', badge: 'blue',   label: 'Standby',        icon: '○' },
+      'not_configured':  { dot: 'gray',   badge: 'gray',   label: 'Not Configured', icon: '–' },
+      'device_missing':  { dot: 'red',    badge: 'red',    label: 'Device Missing', icon: '✗' },
+      'no_driver':       { dot: 'red',    badge: 'red',    label: 'No Driver',      icon: '✗' },
+      'incompatible':    { dot: 'red',    badge: 'red',    label: 'Incompatible',   icon: '✗' },
+      'offline':         { dot: 'red',    badge: 'red',    label: 'Offline',        icon: '✗' },
+    };
+
+    container.innerHTML = '<div class="iface-list">' + interfaces.map(iface => {
+      const status = iface.status || 'not_configured';
+      const si = statusInfo[status] || statusInfo['not_configured'];
+      const isError = ['device_missing','no_driver','incompatible','offline'].includes(status);
+      const isActive = status === 'active';
+      const cardClass = 'iface-card' + (isActive ? ' iface-active' : '') + (isError ? ' iface-error' : '');
+
+      let detail = '';
+      let title = iface.name;
+
+      if (iface.type === 'network') {
+        if (status === 'not_configured') {
+          detail = 'No host configured — set IP address in Configuration tab';
+        } else {
+          detail = esc(iface.host) + ':' + iface.port
+            + ' <span class="badge badge-' + (iface.protocol === 'tcp' ? 'blue' : 'green') + '">'
+            + esc(iface.protocol).toUpperCase() + '</span>'
+            + (iface.secure ? ' <span class="badge badge-purple">Secure</span>' : '');
+        }
+      } else if (iface.type === 'usb') {
+        if (status === 'not_configured') {
+          detail = 'No USB device path — set in Configuration tab or use USB Scanner below';
+        } else {
+          detail = 'Device: ' + esc(iface.device)
+            + ' · Mode: ' + esc(iface.mode)
+            + ' · Priority: ' + esc(iface.priority);
+        }
+      }
+
+      let errorHtml = '';
+      if (iface.error) {
+        errorHtml = '<div class="iface-error-msg">⚠ ' + esc(iface.error) + '</div>';
+      }
+
+      return '<div class="' + cardClass + '">'
+        + '<div class="iface-dot ' + si.dot + '" title="' + si.label + '"></div>'
+        + '<div class="iface-body">'
+        + '<div class="iface-title">' + esc(title) + '</div>'
+        + '<div class="iface-detail">' + detail + '</div>'
+        + errorHtml
+        + '</div>'
+        + '<div class="iface-badge"><span class="badge badge-' + si.badge + '">' + si.label + '</span></div>'
+        + '</div>';
+    }).join('') + '</div>';
+
+    // Add degraded state banner if applicable
+    if (currentState === 'DEGRADED') {
+      container.innerHTML += '<div style="margin-top:12px;padding:12px 16px;background:rgba(248,81,73,.08);'
+        + 'border:1px solid var(--red);border-radius:var(--radius);color:var(--red);font-size:.85rem">'
+        + '⚠ <strong>DEGRADED</strong> — No backends are reachable. '
+        + 'The proxy is retrying all interfaces every few seconds. '
+        + 'Check your network configuration and device connections.</div>';
+    }
   },
 
   /* ── Actions ─────────────────────────────────────────────────── */

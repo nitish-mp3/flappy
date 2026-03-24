@@ -2,7 +2,7 @@ ARG BUILD_FROM
 FROM $BUILD_FROM
 
 # ── Runtime dependencies ──────────────────────────────────────────────
-# socat       – fallback USB serial bridge (if knxd unavailable)
+# socat       – fallback USB serial bridge (serial-only, e.g. /dev/ttyUSB*)
 # knxd        – proper KNX USB HID interface daemon
 # jq          – JSON option parsing in bash
 # python3     – KNX proxy engine
@@ -20,7 +20,11 @@ RUN apk add --no-cache \
     ca-certificates \
     udev \
     libusb \
-    && (apk add --no-cache py3-pyusb 2>/dev/null || pip3 install --no-cache-dir pyusb 2>/dev/null || echo "WARN: pyusb not available — native USB will be disabled") \
+    libusb-dev \
+    && (apk add --no-cache py3-pyusb 2>/dev/null \
+        || (apk add --no-cache py3-pip 2>/dev/null && pip3 install --no-cache-dir --break-system-packages pyusb 2>/dev/null) \
+        || (python3 -m ensurepip 2>/dev/null && python3 -m pip install --no-cache-dir --break-system-packages pyusb 2>/dev/null) \
+        || echo "WARN: pyusb not available — native USB will be disabled") \
     && (apk add --no-cache knxd 2>/dev/null || echo "WARN: knxd not in repo — USB will use native or socat fallback")
 
 # ── Copy files ────────────────────────────────────────────────────────

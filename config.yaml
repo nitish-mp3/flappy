@@ -41,7 +41,13 @@ options:
   primary_device_password: ""
   primary_user_password: ""
 
-
+  # Backup interface
+  backup_host: ""
+  backup_port: 3671
+  backup_protocol: udp
+  backup_secure: false
+  backup_device_password: ""
+  backup_user_password: ""
 
   # USB interface (local knxd or native)
   usb_device: ""
