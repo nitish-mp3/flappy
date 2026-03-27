@@ -426,6 +426,12 @@ class KNXProxy:
             sess.close()
             return
 
+        # Log CRD individual address
+        if crd and len(crd) >= 4:
+            ia_hi, ia_lo = crd[2], crd[3]
+            ia_str = f"{(ia_hi >> 4) & 0xF}.{ia_hi & 0xF}.{ia_lo}"
+            log.info(f"Session ch={ch_id}: tunnel address={ia_str} CRD={crd.hex()}")
+
         log.info(f"Session ch={ch_id} established: "
                  f"{client_type.upper()} {client_ctrl[0]}:{client_ctrl[1]} ↔ "
                  f"{b_proto.upper()} {b_host}:{b_port}")
@@ -438,6 +444,8 @@ class KNXProxy:
         """Read frames from backend and forward to client."""
         udp_sock = self.udp.sock if self.udp else None
         relay_count = 0
+        log.info(f"Relay thread started for ch={sess.channel_id} "
+                 f"backend={sess.backend_addr} type={sess.backend_type}")
 
         while sess.alive and self.running:
             try:
@@ -468,6 +476,12 @@ class KNXProxy:
             dest = sess.client_data or sess.client_ctrl
 
             if svc in (TUNNELLING_REQ, TUNNELLING_ACK, CONNSTATE_RESP, DISCONNECT_RESP):
+                # Immediately ACK incoming TUNNELLING_REQ from backend
+                # so it doesn't time out waiting for the full client round-trip
+                if svc == TUNNELLING_REQ:
+                    ack_body = bytes([0x04, body[1], body[2], 0x00])
+                    sess.send_to_backend(make_frame(TUNNELLING_ACK, ack_body))
+
                 ok = sess.send_to_client(data, udp_sock)
                 if svc in (TUNNELLING_REQ, TUNNELLING_ACK):
                     sess.telegrams_fwd += 1
@@ -493,6 +507,10 @@ class KNXProxy:
                          f"(uptime={sess.uptime():.0f}s, telegrams={sess.telegrams_fwd})")
                 sess.close()
                 return
+
+            else:
+                log.info(f"Relay ch={sess.channel_id}: unhandled "
+                         f"{svc_name(svc)} svc=0x{svc:04X} len={len(body)}")
 
         # Backend connection lost — try hot-swap to new backend
         if sess.alive:
@@ -860,8 +878,23 @@ class KNXProxy:
                     sess = self.sessions.get(ch)
                     if sess and sess.alive:
                         sess.last_seen = time.monotonic()
-                        sess.send_to_backend(make_frame(svc, body))
-                        sess.telegrams_fwd += 1
+                        # Immediately ACK client TUNNELLING_REQ so xknx
+                        # doesn't timeout waiting for backend round-trip
+                        if svc == TUNNELLING_REQ:
+                            ack_body = bytes([0x04, body[1], body[2], 0x00])
+                            try:
+                                sock.sendall(make_frame(TUNNELLING_ACK, ack_body))
+                            except Exception:
+                                pass
+                        ok = sess.send_to_backend(make_frame(svc, body))
+                        if svc == TUNNELLING_REQ:
+                            sess.telegrams_fwd += 1
+                            log.info(f"Client→Backend ch={ch}: "
+                                     f"seq={body[2]} len={len(body)} "
+                                     f"fwd={'OK' if ok else 'FAIL'}")
+                    else:
+                        log.warning(f"No session for {svc_name(svc)} "
+                                    f"ch={ch} from {addr[0]}:{addr[1]}")
 
                 elif svc == CONNSTATE_REQ:
                     if not body:
