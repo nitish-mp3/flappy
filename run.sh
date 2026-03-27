@@ -22,7 +22,7 @@ readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly WEBUI_PID_FILE="/run/knx-webui.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="4.2.3"
+readonly VERSION="4.2.4"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -862,6 +862,18 @@ tick_usb() {
     # Check USB bridge is still alive
     if ! is_usb_bridge_alive; then
         if ! usb_probe "$USB_DEVICE"; then
+            # Device path gone — try to rediscover at new path
+            if [[ "$HAS_PYUSB" == "true" ]]; then
+                local new_path
+                new_path="$(python3 /knx_usb.py --discover 2>/dev/null | jq -r '.devices[0].path // ""' 2>/dev/null || true)"
+                if [[ -n "$new_path" ]] && usb_probe "$new_path"; then
+                    log_info "USB device re-discovered at ${new_path} (was ${USB_DEVICE})"
+                    USB_DEVICE="$new_path"
+                    log_warn "USB bridge died; restarting with new path"
+                    start_usb_bridge "$USB_DEVICE" || enter_degraded "usb-bridge-restart-failed"
+                    return 0
+                fi
+            fi
             log_error "USB device gone"; enter_degraded "usb-device-gone"
         else
             log_warn "USB bridge died; restarting"
@@ -898,7 +910,17 @@ tick_degraded() {
             log_notice "knxd available"; enter_knxd "$kproto"; return 0; fi
     fi
 
-    # Try USB
+    # Try USB — rediscover if stored path is gone
+    if [[ -n "$USB_DEVICE" ]] && ! usb_probe "$USB_DEVICE"; then
+        if [[ "$HAS_PYUSB" == "true" ]]; then
+            local new_path
+            new_path="$(python3 /knx_usb.py --discover 2>/dev/null | jq -r '.devices[0].path // ""' 2>/dev/null || true)"
+            if [[ -n "$new_path" ]] && usb_probe "$new_path"; then
+                log_info "USB device re-discovered at ${new_path} (was ${USB_DEVICE})"
+                USB_DEVICE="$new_path"
+            fi
+        fi
+    fi
     if [[ -n "$USB_DEVICE" ]] && usb_probe "$USB_DEVICE"; then
         # Check USB bridge cooldown (exponential backoff after failures)
         if [[ "$USB_BRIDGE_FAIL_COUNT" -gt 0 ]] && [[ "$USB_BRIDGE_FAIL_TS" -gt 0 ]]; then

@@ -539,6 +539,13 @@ class KNXUSBBridge:
     - cEMI ↔ USB HID translation
     """
 
+    # Default individual address for tunnel connections: 15.15.250 (0xFFFA)
+    # This is used in the CRD of CONNECT_RESP so the client (e.g. xknx)
+    # uses it as the source address in outgoing L_Data.req frames.
+    # A valid address is REQUIRED — 0.0.0 causes USB interfaces to
+    # reject frames because the source doesn't match any assigned address.
+    USB_TUNNEL_ADDR = b'\x04\x04\xFF\xFA'  # CRD: 15.15.250
+
     def __init__(self, usb_transport: KNXUSBTransport, port: int = 13671):
         self.usb = usb_transport
         self.port = port
@@ -551,6 +558,7 @@ class KNXUSBBridge:
         self._recv_seq: int = 0
         self._send_seq: int = 0
         self._usb_reader_thread: Optional[threading.Thread] = None
+        self._tunnel_crd = self.USB_TUNNEL_ADDR
 
     def start(self) -> bool:
         """Start the local KNXnet/IP server."""
@@ -623,7 +631,6 @@ class KNXUSBBridge:
             TUNNELLING_REQ, TUNNELLING_ACK, DESCRIPTION_REQ, DESCRIPTION_RESP,
             PROTO_TCP, E_NO_ERROR,
             make_frame, make_hpai, parse_frame, read_tcp_frame,
-            CRD_DEFAULT, CRI_TUNNEL_V1,
         )
 
         try:
@@ -660,10 +667,13 @@ class KNXUSBBridge:
                     resp_body = (
                         bytes([ch_id, E_NO_ERROR])
                         + make_hpai('0.0.0.0', 0, PROTO_TCP)
-                        + CRD_DEFAULT
+                        + self._tunnel_crd
                     )
                     sock.sendall(make_frame(CONNECT_RESP, resp_body))
-                    log.info(f"USB bridge: tunnel ch={ch_id} established")
+                    addr_hi, addr_lo = self._tunnel_crd[2], self._tunnel_crd[3]
+                    addr_str = f"{addr_hi >> 4}.{addr_hi & 0x0F}.{addr_lo}"
+                    log.info(f"USB bridge: tunnel ch={ch_id} established "
+                             f"(individual address {addr_str})")
 
                 elif svc == CONNSTATE_REQ:
                     if body and len(body) >= 1:
@@ -697,7 +707,10 @@ class KNXUSBBridge:
                         # Extract cEMI and forward to USB
                         cemi = body[4:]
                         if len(cemi) > 0:
-                            self.usb.send_cemi(cemi)
+                            mc = cemi[0] if cemi else 0
+                            ok = self.usb.send_cemi(cemi)
+                            log.debug(f"USB→bus: cEMI mc=0x{mc:02X} "
+                                      f"len={len(cemi)} {'OK' if ok else 'FAIL'}")
 
                 elif svc == TUNNELLING_ACK:
                     # Client acknowledged our TUNNELLING_REQUEST — nothing to do
@@ -729,6 +742,9 @@ class KNXUSBBridge:
             cemi = self.usb.recv_cemi(timeout_ms=500)
             if cemi is None:
                 continue
+
+            mc = cemi[0] if cemi else 0
+            log.debug(f"bus→USB: cEMI mc=0x{mc:02X} len={len(cemi)}")
 
             # Only forward if we have an active tunnel and client
             if self.active_channel == 0 or self._client_sock is None:

@@ -210,7 +210,7 @@ class BackendConnector:
             return self._negotiate_udp(bsock, host, port, client_cri)
 
     def _negotiate_tcp(self, bsock, host, port, client_cri=None):
-        """TCP tunnel negotiation — fresh socket per attempt."""
+        """TCP tunnel negotiation — fresh socket per attempt after rejection."""
         import time as _time
         from knx_const import (
             CONNECT_REQ, CONNECT_RESP, PROTO_TCP,
@@ -218,28 +218,25 @@ class BackendConnector:
             make_frame, make_hpai, parse_hpai, read_tcp_frame,
         )
 
-        # TCP: 2 attempts max, each on a fresh socket
+        # TCP: 2 attempts max.  First attempt reuses the caller's socket;
+        # subsequent attempts open fresh sockets (KNXnet/IP TCP only allows
+        # ONE CONNECT per connection — after rejection state is undefined).
         tcp_attempts = [
             (True, CRI_TUNNEL_V1, 'tcp-zero+v1'),    # zero HPAI
             (False, CRI_TUNNEL_V1, 'tcp-local+v1'),  # NAT HPAI
         ]
 
-        # Close the original socket — we'll open fresh ones
-        try:
-            bsock.close()
-        except Exception:
-            pass
-
         last_status = None
         for i, (use_zero, cri, label) in enumerate(tcp_attempts):
-            if i > 0:
+            if i == 0:
+                sock = bsock  # reuse the already-connected socket
+            else:
                 _time.sleep(1.0)
-
-            try:
-                sock = self.open_socket(host, port, 'tcp')
-            except Exception as e:
-                log.debug(f"TCP connect failed for {label}: {e}")
-                continue
+                try:
+                    sock = self.open_socket(host, port, 'tcp')
+                except Exception as e:
+                    log.debug(f"TCP connect failed for {label}: {e}")
+                    continue
 
             local_ip, local_port = sock.getsockname()[:2]
             if use_zero:
