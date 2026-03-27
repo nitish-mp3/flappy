@@ -391,6 +391,20 @@ class KNXProxy:
         if bsock:
             bsock.settimeout(65.0)
 
+        # If non-secure mode and TCP backend: probe the assigned slot NOW,
+        # before forwarding CONNECT_RESP to the client.  If it is a KNX IP Secure
+        # slot (SECURE_WRAPPER response to plain CONNSTATE_REQ), switch to a plain
+        # adjacent slot so the client is told the CORRECT individual address from
+        # the very first frame.  This prevents CEMI source-address mismatches that
+        # cause the backend to silently drop outgoing frames and stop forwarding
+        # incoming bus telegrams to our tunnel.
+        if not PRIMARY_SECURE and b_proto == 'tcp' and bsock and crd:
+            bsock, ch_id, crd = self._avoid_secure_early(
+                bsock, ch_id, crd, b_host, b_port, b_proto
+            )
+            if crd is None:
+                crd = CRD_DEFAULT
+
         # Build client-facing CONNECT_RESPONSE
         # For TCP: HPAI must be 0.0.0.0:0 (= "use this TCP connection for data")
         # For UDP: HPAI is 0.0.0.0:0 (= "use sender address")
@@ -438,7 +452,151 @@ class KNXProxy:
                  f"{b_proto.upper()} {b_host}:{b_port}")
 
     # ──────────────────────────────────────────────────────────────────
-    # SECURE_WRAPPER auto-reconnect
+    # SECURE slot detection and avoidance
+    # ──────────────────────────────────────────────────────────────────
+
+    def _probe_slot_secure(self, sock: socket.socket,
+                           ch_id: int, proto_code: int) -> bool:
+        """
+        Send a plain CONNECTIONSTATE_REQ to the backend and return True if the
+        response is SECURE_WRAPPER (meaning the slot is ETS-configured for
+        KNX IP Secure and wraps all frames — even plain CONNECT_REQ connections).
+
+        We probe BEFORE forwarding CONNECT_RESP to the client so that the client
+        is always told the correct individual address from the very first frame.
+        """
+        try:
+            probe_body = bytes([ch_id, 0x00]) + make_hpai('0.0.0.0', 0, proto_code)
+            sock.settimeout(3.0)
+            sock.sendall(make_frame(CONNSTATE_REQ, probe_body))
+            svc, _ = read_tcp_frame(sock)
+            return svc == SECURE_WRAPPER
+        except socket.timeout:
+            # No response within 3 s → treat as plain (non-secure)
+            return False
+        except Exception:
+            return False
+        finally:
+            sock.settimeout(65.0)
+
+    def _avoid_secure_early(
+        self,
+        bsock: socket.socket, ch_id: int, crd: bytes,
+        b_host: str, b_port: int, b_proto: str,
+    ) -> Tuple[socket.socket, int, bytes]:
+        """
+        Called right after a successful backend CONNECT, BEFORE the client sees
+        CONNECT_RESP.  Probes the assigned slot; if it is a KNX IP Secure slot
+        (responds with SECURE_WRAPPER to a plain CONNSTATE_REQ), tries adjacent
+        individual addresses with the extended 6-byte CRI until a plain slot is
+        found.
+
+        Returns (socket, channel_id, crd) — either the original if already plain,
+        or a new socket on a plain slot.  If no plain slot is found the original
+        secure socket is returned so the mid-relay _secure_reconnect can retry.
+        """
+        proto_code = PROTO_TCP if b_proto == 'tcp' else PROTO_UDP
+
+        if not self._probe_slot_secure(bsock, ch_id, proto_code):
+            return bsock, ch_id, crd  # already plain — nothing to do
+
+        ia_hi = crd[2] if crd and len(crd) >= 4 else 0
+        ia_lo = crd[3] if crd and len(crd) >= 4 else 0
+        current_ia  = (ia_hi << 8) | ia_lo
+        current_str = f"{(ia_hi >> 4) & 0xF}.{ia_hi & 0xF}.{ia_lo}"
+        log.info(f"Pre-session: slot {current_str} is KNX IP Secure — "
+                 f"scanning for plain slot before telling client")
+
+        for delta in (-1, +1, -2, +2):
+            alt_ia = current_ia + delta
+            if alt_ia < 0 or alt_ia > 0xFFFF:
+                continue
+            alt_hi  = (alt_ia >> 8) & 0xFF
+            alt_lo  = alt_ia & 0xFF
+            alt_str = f"{(alt_hi >> 4) & 0xF}.{alt_hi & 0xF}.{alt_lo}"
+            ext_cri = bytes([0x06, 0x04, 0x02, 0x00, alt_hi, alt_lo])
+
+            try:
+                new_sock = self.connector.open_socket(b_host, b_port, b_proto)
+                new_sock.settimeout(5.0)
+            except Exception as e:
+                log.debug(f"Pre-session avoidance: connect failed for {alt_str}: {e}")
+                continue
+
+            try:
+                ctrl_h = make_hpai('0.0.0.0', 0, proto_code)
+                data_h = make_hpai('0.0.0.0', 0, proto_code)
+                new_sock.sendall(make_frame(CONNECT_REQ, ctrl_h + data_h + ext_cri))
+                r_svc, r_body = read_tcp_frame(new_sock)
+            except Exception as e:
+                log.debug(f"Pre-session avoidance: CONNECT error for {alt_str}: {e}")
+                new_sock.close()
+                continue
+
+            if r_svc != CONNECT_RESP or not r_body or len(r_body) < 2:
+                new_sock.close()
+                continue
+
+            new_ch, status = r_body[0], r_body[1]
+            if status != 0x00:
+                log.debug(f"Pre-session avoidance: {alt_str} rejected "
+                          f"0x{status:02x}")
+                new_sock.close()
+                if status in (0x24, 0x25):
+                    break
+                continue
+
+            # Parse CRD from response
+            new_crd = crd  # fallback
+            if len(r_body) >= 10:
+                _, _, _, off = parse_hpai(r_body, 2)
+                if off < len(r_body):
+                    new_crd = r_body[off:]
+            elif len(r_body) > 2:
+                new_crd = r_body[2:]
+
+            # Probe this candidate slot before committing
+            new_sock.settimeout(65.0)  # needed for probe helper
+            if self._probe_slot_secure(new_sock, new_ch, proto_code):
+                log.debug(f"Pre-session avoidance: {alt_str} is also secure")
+                try:
+                    disc = bytes([new_ch, 0x00]) + make_hpai('0.0.0.0', 0, proto_code)
+                    new_sock.settimeout(2.0)
+                    new_sock.sendall(make_frame(DISCONNECT_REQ, disc))
+                except Exception:
+                    pass
+                new_sock.close()
+                continue
+
+            # Found a plain slot — disconnect secure slot and switch
+            ia_str = alt_str
+            if new_crd and len(new_crd) >= 4:
+                n_hi, n_lo = new_crd[2], new_crd[3]
+                ia_str = f"{(n_hi >> 4) & 0xF}.{n_hi & 0xF}.{n_lo}"
+
+            try:
+                disc = bytes([ch_id, 0x00]) + make_hpai('0.0.0.0', 0, proto_code)
+                bsock.settimeout(2.0)
+                bsock.sendall(make_frame(DISCONNECT_REQ, disc))
+                time.sleep(0.2)
+            except Exception:
+                pass
+            try:
+                bsock.close()
+            except Exception:
+                pass
+
+            new_sock.settimeout(65.0)
+            log.info(f"Pre-session secure avoidance succeeded — "
+                     f"plain slot {ia_str} (ch={new_ch})")
+            return new_sock, new_ch, new_crd
+
+        log.warning(f"Pre-session: no plain slot found adjacent to {current_str} — "
+                    f"proceeding with secure slot (mid-relay avoidance will retry)")
+        return bsock, ch_id, crd
+
+    # ──────────────────────────────────────────────────────────────────
+    # SECURE_WRAPPER mid-relay reconnect (fallback safety net)
     # ──────────────────────────────────────────────────────────────────
 
     def _secure_reconnect(self, sess: Session) -> bool:
