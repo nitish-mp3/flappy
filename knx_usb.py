@@ -421,9 +421,10 @@ class KNXUSBTransport:
         Byte 4:     Protocol version (0x00)
         Byte 5:     Header length (0x08)
         Byte 6-7:   Body length (length of cEMI data)
-        Byte 8-9:   Protocol ID, big-endian (0x0001 = KNX Tunnel)
-        Byte 10:    EMI type (0x03 = cEMI)
-        Byte 11:    Manufacturer code (0x00)
+        Byte 8:     EMI ID (0x03 = cEMI)  — single-byte field per EN 13321-2
+        Byte 9:     Manufacturer code MSB (0x00)
+        Byte 10:    Manufacturer code LSB (0x00)
+        Byte 11:    Reserved (0x00)
         Byte 12+:   cEMI data
         Padded to 64 bytes with 0x00
         """
@@ -437,10 +438,10 @@ class KNXUSBTransport:
         report[4] = KNX_USB_PROTOCOL_VERSION
         report[5] = KNX_USB_HEADER_LENGTH
         struct.pack_into('>H', report, 6, body_length)
-        report[8] = 0x00                  # Protocol ID high byte
-        report[9] = 0x01                  # Protocol ID low byte (0x0001 = KNX Tunnel)
-        report[10] = EMI_CEMI             # EMI type (0x03 = cEMI)
-        report[11] = 0x00                 # Manufacturer code
+        report[8] = EMI_CEMI              # EMI ID (single byte): 0x03 = cEMI
+        report[9] = 0x00                  # Manufacturer code MSB
+        report[10] = 0x00                 # Manufacturer code LSB
+        report[11] = 0x00                 # Reserved
         report[12:12 + body_length] = cemi_data
 
         return bytes(report)
@@ -463,18 +464,18 @@ class KNXUSBTransport:
             return None
 
         body_length = struct.unpack_from('>H', report, 6)[0]
-        # Protocol ID is 2-byte big-endian at bytes 8-9
-        proto_id = struct.unpack_from('>H', report, 8)[0]
-        # EMI type is at byte 10 (NOT byte 9)
-        emi_id = report[10]
+        # EMI ID is a single byte at position 8 (per EN 13321-2 / device behaviour)
+        emi_id = report[8]
 
-        if proto_id != 0x0001:  # Not KNX Tunnel
-            if proto_id != 0x0000:  # Don't spam log with idle reports
-                log.debug(f"Non-tunnel report (proto=0x{proto_id:04x} emi=0x{emi_id:02x})")
-            return None
+        # Log first 12 header bytes once to confirm layout (DEBUG only)
+        if not getattr(self, '_hid_layout_logged', False):
+            self._hid_layout_logged = True
+            log.debug(f"HID report header bytes 0-15: "
+                      f"{' '.join(f'{b:02x}' for b in report[:16])}")
 
-        if emi_id != EMI_CEMI:
-            log.debug(f"Non-cEMI tunnel report (emi=0x{emi_id:02x})")
+        if emi_id != EMI_CEMI:  # 0x03 = cEMI
+            if emi_id != 0x00:  # 0x00 = idle/empty — don't log
+                log.debug(f"Non-cEMI report (emi=0x{emi_id:02x})")
             return None
 
         if body_length == 0:
@@ -519,8 +520,8 @@ class KNXUSBTransport:
             log.debug(f"Feature Get 0x{feature_id:02x}: write failed")
             return None
 
-        for _ in range(10):
-            raw = self._read_report(timeout_ms=500)
+        for _ in range(3):  # short timeout — many devices don't support Feature Service
+            raw = self._read_report(timeout_ms=100)
             if raw is None:
                 continue
             if len(raw) < 13:
