@@ -152,11 +152,17 @@ def parse_frame(data: bytes) -> Tuple[Optional[int], Optional[bytes]]:
 
 
 def recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
-    """Read exactly `n` bytes from a TCP socket."""
+    """Read exactly `n` bytes from a TCP socket.
+
+    Raises socket.timeout so callers can handle timeouts
+    without desynchronizing the TCP stream.
+    """
     buf = b''
     while len(buf) < n:
         try:
             chunk = sock.recv(n - len(buf))
+        except socket.timeout:
+            raise  # Caller must handle — partial read would desync stream
         except Exception:
             return None
         if not chunk:

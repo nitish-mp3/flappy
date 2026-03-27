@@ -437,12 +437,14 @@ class KNXProxy:
     def _relay_from_backend(self, sess: Session):
         """Read frames from backend and forward to client."""
         udp_sock = self.udp.sock if self.udp else None
+        relay_count = 0
 
         while sess.alive and self.running:
             try:
                 if sess.backend_type == 'tcp':
                     svc, body = read_tcp_frame(sess.backend_sock)
                     if svc is None:
+                        log.info(f"Relay ch={sess.channel_id}: backend stream ended")
                         break
                     data = make_frame(svc, body)
                 else:
@@ -466,9 +468,19 @@ class KNXProxy:
             dest = sess.client_data or sess.client_ctrl
 
             if svc in (TUNNELLING_REQ, TUNNELLING_ACK, CONNSTATE_RESP, DISCONNECT_RESP):
-                sess.send_to_client(data, udp_sock)
+                ok = sess.send_to_client(data, udp_sock)
                 if svc in (TUNNELLING_REQ, TUNNELLING_ACK):
                     sess.telegrams_fwd += 1
+                    relay_count += 1
+                    if relay_count <= 5 or relay_count % 50 == 0:
+                        mc = body[4] if len(body) > 4 else 0
+                        log.info(f"Relay ch={sess.channel_id}: {svc_name(svc)} "
+                                 f"seq={body[2] if len(body) > 2 else '?'} "
+                                 f"mc=0x{mc:02X} len={len(body)} "
+                                 f"→client={'OK' if ok else 'FAIL'} "
+                                 f"(total={relay_count})")
+                elif svc == CONNSTATE_RESP:
+                    log.debug(f"Relay ch={sess.channel_id}: CONNSTATE_RESP → client")
 
             elif svc == DISCONNECT_REQ:
                 # Backend initiated disconnect
