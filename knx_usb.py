@@ -497,10 +497,10 @@ class KNXUSBTransport:
                     )
                 return True
             except usb.core.USBError as e:
-                log.debug(f"USB write error: {e}")
+                log.warning(f"USB write error: {e}")
                 return False
             except Exception as e:
-                log.debug(f"USB write exception: {e}")
+                log.warning(f"USB write exception: {e}")
                 return False
 
     def _read_report(self, timeout_ms: int = 1000) -> Optional[bytes]:
@@ -707,10 +707,22 @@ class KNXUSBBridge:
                         # Extract cEMI and forward to USB
                         cemi = body[4:]
                         if len(cemi) > 0:
-                            mc = cemi[0] if cemi else 0
+                            mc = cemi[0]
+                            # For L_Data.req, override source address to 0.0.0
+                            # so the USB interface uses its own programmed address.
+                            # Without this, the interface rejects frames with an
+                            # unrecognized source (e.g. 15.15.250 from the CRD).
+                            if mc == CEMI_L_DATA_REQ and len(cemi) >= 6:
+                                ai_len = cemi[1]
+                                src_off = 4 + ai_len
+                                if src_off + 2 <= len(cemi):
+                                    cemi = bytearray(cemi)
+                                    cemi[src_off] = 0x00
+                                    cemi[src_off + 1] = 0x00
+                                    cemi = bytes(cemi)
                             ok = self.usb.send_cemi(cemi)
-                            log.debug(f"USB→bus: cEMI mc=0x{mc:02X} "
-                                      f"len={len(cemi)} {'OK' if ok else 'FAIL'}")
+                            log.info(f"→USB: cEMI mc=0x{mc:02X} "
+                                     f"len={len(cemi)} {'OK' if ok else 'FAIL'}")
 
                 elif svc == TUNNELLING_ACK:
                     # Client acknowledged our TUNNELLING_REQUEST — nothing to do
@@ -744,7 +756,7 @@ class KNXUSBBridge:
                 continue
 
             mc = cemi[0] if cemi else 0
-            log.debug(f"bus→USB: cEMI mc=0x{mc:02X} len={len(cemi)}")
+            log.info(f"←USB: cEMI mc=0x{mc:02X} len={len(cemi)}")
 
             # Only forward if we have an active tunnel and client
             if self.active_channel == 0 or self._client_sock is None:
@@ -770,8 +782,9 @@ class KNXUSBBridge:
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
+    log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
     )

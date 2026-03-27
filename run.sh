@@ -468,7 +468,7 @@ start_usb_native() {
         return 1
     fi
 
-    python3 /knx_usb.py --bridge "$dev" --port "$lport" &
+    LOG_LEVEL="$LOG_LEVEL" python3 /knx_usb.py --bridge "$dev" --port "$lport" &
     NATIVE_USB_PID="$!"
     echo "$NATIVE_USB_PID" > "$NATIVE_USB_PID_FILE"
     sleep 3
