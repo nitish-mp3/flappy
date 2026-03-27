@@ -414,35 +414,36 @@ class KNXUSBTransport:
         """
         Build a 64-byte KNX USB HID report containing a cEMI frame.
 
-        Format (per EN 13321-2 / calimero reference):
+        Layout confirmed by device hex dump:
         Byte 0:     Report ID (0x01)
-        Byte 1:     Packet info (0x01 = single complete packet)
-        Byte 2-3:   Data length (of KNX USB Transfer Protocol data)
-        Byte 4:     Protocol version (0x00)
-        Byte 5:     Header length (0x08)
-        Byte 6-7:   Body length (length of cEMI data)
-        Byte 8:     EMI ID (0x03 = cEMI)  — single-byte field per EN 13321-2
-        Byte 9:     Manufacturer code MSB (0x00)
-        Byte 10:    Manufacturer code LSB (0x00)
-        Byte 11:    Reserved (0x00)
-        Byte 12+:   cEMI data
+        Byte 1:     Packet Info (0x13 = start+end, single packet)
+        Byte 2:     Data Length — single byte (transfer header + body)
+        ── KNX USB Transfer Protocol Header (8 bytes) ──
+        Byte 3:     Protocol Version (0x00)
+        Byte 4:     Header Length (0x08)
+        Byte 5-6:   Body Length (big-endian, length of cEMI data)
+        Byte 7:     Protocol ID (0x01 = KNX Tunnel) — single byte
+        Byte 8:     EMI ID (0x03 = cEMI)
+        Byte 9-10:  Manufacturer code (0x0000)
+        ── Body ──
+        Byte 11+:   cEMI data
         Padded to 64 bytes with 0x00
         """
         body_length = len(cemi_data)
-        transfer_length = KNX_USB_HEADER_SIZE + body_length
+        data_length = KNX_USB_HEADER_SIZE + body_length  # header(8) + cEMI
 
         report = bytearray(HID_REPORT_SIZE)
-        report[0] = HID_REPORT_ID
-        report[1] = 0x01                  # Single complete packet
-        struct.pack_into('>H', report, 2, transfer_length)
-        report[4] = KNX_USB_PROTOCOL_VERSION
-        report[5] = KNX_USB_HEADER_LENGTH
-        struct.pack_into('>H', report, 6, body_length)
-        report[8] = EMI_CEMI              # EMI ID (single byte): 0x03 = cEMI
-        report[9] = 0x00                  # Manufacturer code MSB
-        report[10] = 0x00                 # Manufacturer code LSB
-        report[11] = 0x00                 # Reserved
-        report[12:12 + body_length] = cemi_data
+        report[0] = HID_REPORT_ID           # 0x01
+        report[1] = 0x13                     # Packet Info: start+end
+        report[2] = data_length              # Single-byte data length
+        report[3] = KNX_USB_PROTOCOL_VERSION # 0x00
+        report[4] = KNX_USB_HEADER_LENGTH    # 0x08
+        struct.pack_into('>H', report, 5, body_length)
+        report[7] = 0x01                     # Protocol ID: KNX Tunnel
+        report[8] = EMI_CEMI                 # 0x03 = cEMI
+        report[9] = 0x00                     # Manufacturer high
+        report[10] = 0x00                    # Manufacturer low
+        report[11:11 + body_length] = cemi_data
 
         return bytes(report)
 
@@ -451,38 +452,42 @@ class KNXUSBTransport:
         Parse a KNX USB HID report and extract the cEMI frame.
         Returns the cEMI data or None if invalid.
         """
-        if len(report) < 12:
+        if len(report) < 11:
             return None
 
         report_id = report[0]
         if report_id != HID_REPORT_ID:
             return None
 
-        # Parse KNX USB Transfer Protocol Header
-        transfer_length = struct.unpack_from('>H', report, 2)[0]
-        if transfer_length < KNX_USB_HEADER_SIZE:
+        # Byte 2 = single-byte data length (transfer header + body)
+        data_length = report[2]
+        if data_length < KNX_USB_HEADER_SIZE:
             return None
 
-        body_length = struct.unpack_from('>H', report, 6)[0]
-        # EMI ID is a single byte at position 8 (per EN 13321-2 / device behaviour)
-        emi_id = report[8]
+        # Transfer Protocol Header starts at byte 3
+        header_length = report[4]  # usually 0x08
+        body_length = struct.unpack_from('>H', report, 5)[0]
+        protocol_id = report[7]    # 0x01 = KNX Tunnel
+        emi_id = report[8]         # 0x03 = cEMI
 
-        # Log first 12 header bytes once to confirm layout (DEBUG only)
+        # One-time hex dump for diagnostics
         if not getattr(self, '_hid_layout_logged', False):
             self._hid_layout_logged = True
-            log.debug(f"HID report header bytes 0-15: "
-                      f"{' '.join(f'{b:02x}' for b in report[:16])}")
+            log.info(f"HID hdr: {' '.join(f'{b:02x}' for b in report[:16])} "
+                     f"(data_len={data_length} hdr_len={header_length} "
+                     f"body_len={body_length} proto=0x{protocol_id:02x} "
+                     f"emi=0x{emi_id:02x})")
 
-        if emi_id != EMI_CEMI:  # 0x03 = cEMI
-            if emi_id != 0x00:  # 0x00 = idle/empty — don't log
+        if emi_id != EMI_CEMI:
+            if emi_id != 0x00:  # Don't log idle/empty
                 log.debug(f"Non-cEMI report (emi=0x{emi_id:02x})")
             return None
 
         if body_length == 0:
             return None
 
-        # cEMI data starts after the 12-byte header
-        cemi_start = 12
+        # cEMI data starts at byte 3 + header_length (normally byte 11)
+        cemi_start = 3 + header_length
         cemi_end = cemi_start + body_length
         if cemi_end > len(report):
             cemi_end = len(report)
@@ -493,24 +498,24 @@ class KNXUSBTransport:
 
     def _build_feature_report(self, feature_id: int, svc_type: int,
                               value: bytes = b'') -> bytes:
-        """Build HID report for Feature Service (Protocol ID 0x0004)."""
+        """Build HID report for Feature Service (Protocol ID 0x04)."""
         body_length = 1 + len(value)  # feature_id + value
-        transfer_length = KNX_USB_HEADER_SIZE + body_length
+        data_length = KNX_USB_HEADER_SIZE + body_length
 
         report = bytearray(HID_REPORT_SIZE)
-        report[0] = HID_REPORT_ID
-        report[1] = 0x01
-        struct.pack_into('>H', report, 2, transfer_length)
-        report[4] = KNX_USB_PROTOCOL_VERSION
-        report[5] = KNX_USB_HEADER_LENGTH
-        struct.pack_into('>H', report, 6, body_length)
-        report[8] = 0x00                  # Protocol ID high
-        report[9] = 0x04                  # Protocol ID low (0x0004 = Feature)
-        report[10] = svc_type             # 0x01=Get, 0x03=Set
-        report[11] = 0x00
-        report[12] = feature_id
+        report[0] = HID_REPORT_ID           # 0x01
+        report[1] = 0x13                     # Packet Info: single packet
+        report[2] = data_length              # Single-byte data length
+        report[3] = KNX_USB_PROTOCOL_VERSION # 0x00
+        report[4] = KNX_USB_HEADER_LENGTH    # 0x08
+        struct.pack_into('>H', report, 5, body_length)
+        report[7] = 0x04                     # Protocol ID: Feature Service
+        report[8] = svc_type                 # 0x01=Get, 0x03=Set
+        report[9] = 0x00                     # Manufacturer high
+        report[10] = 0x00                    # Manufacturer low
+        report[11] = feature_id
         if value:
-            report[13:13 + len(value)] = value
+            report[12:12 + len(value)] = value
         return bytes(report)
 
     def _feature_get(self, feature_id: int) -> Optional[bytes]:
@@ -524,13 +529,12 @@ class KNXUSBTransport:
             raw = self._read_report(timeout_ms=100)
             if raw is None:
                 continue
-            if len(raw) < 13:
+            if len(raw) < 12:
                 continue
-            proto_id = struct.unpack_from('>H', raw, 8)[0]
-            svc = raw[10]
-            if proto_id == 0x0004 and svc == 0x02 and raw[12] == feature_id:
-                bl = struct.unpack_from('>H', raw, 6)[0]
-                return bytes(raw[13:12 + bl]) if bl > 1 else bytes()
+            # Protocol ID at byte 7, service type at byte 8
+            if raw[7] == 0x04 and raw[8] == 0x02 and raw[11] == feature_id:
+                bl = struct.unpack_from('>H', raw, 5)[0]
+                return bytes(raw[12:11 + bl]) if bl > 1 else bytes()
 
         log.debug(f"Feature Get 0x{feature_id:02x}: no response")
         return None
