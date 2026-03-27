@@ -42,7 +42,7 @@ class Session:
         'client_sock', 'backend_type', 'backend_addr', 'backend_sock',
         'last_seen', 'alive', 'created_at',
         'bytes_in', 'bytes_out', 'telegrams_fwd', 'errors',
-        'draining', 'drain_event',
+        'draining', 'drain_event', 'crd', '_backend_ch',
     ]
 
     def __init__(self, channel_id: int, client_type: str,
@@ -63,6 +63,8 @@ class Session:
         self.alive        = True
         self.draining     = False
         self.drain_event  = threading.Event()
+        self.crd          = None
+        self._backend_ch  = channel_id
 
         # Metrics
         self.bytes_in     = 0
@@ -121,7 +123,7 @@ class Session:
         self.backend_sock = new_sock
         self.backend_type = new_type
         self.backend_addr = new_addr
-        self.channel_id = new_channel_id
+        self._backend_ch = new_channel_id
         self.last_seen = time.monotonic()
         self.errors = 0
         log.info(f"Session hot-swapped to {new_type.upper()} {new_addr[0]}:{new_addr[1]} ch={new_channel_id}")
