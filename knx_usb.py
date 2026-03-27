@@ -262,6 +262,7 @@ class KNXUSBTransport:
         self.interface = None
         self.running = False
         self._lock = threading.Lock()
+        self.individual_addr = None  # (hi, lo) tuple read from device
 
     def open(self) -> bool:
         """Open and configure the USB device."""
@@ -352,6 +353,9 @@ class KNXUSBTransport:
             log.info(f"USB device opened: {self.device_path} "
                      f"(IN=0x{self.ep_in.bEndpointAddress:02x}"
                      f"{', OUT=0x' + format(self.ep_out.bEndpointAddress, '02x') if self.ep_out else ', no OUT'})")
+
+            # Initialize device for cEMI tunnel mode
+            self._init_tunnel_mode()
             return True
 
         except Exception as e:
@@ -410,17 +414,16 @@ class KNXUSBTransport:
         """
         Build a 64-byte KNX USB HID report containing a cEMI frame.
 
-        Format (per EN 13321-2):
+        Format (per EN 13321-2 / calimero reference):
         Byte 0:     Report ID (0x01)
-        Byte 1:     Packet info (reserved | sequence)
+        Byte 1:     Packet info (0x01 = single complete packet)
         Byte 2-3:   Data length (of KNX USB Transfer Protocol data)
         Byte 4:     Protocol version (0x00)
         Byte 5:     Header length (0x08)
-        Byte 6-7:   Body length
-        Byte 8:     Protocol ID (0x01 = KNX Tunnel)
-        Byte 9:     EMI ID (0x03 = cEMI)
-        Byte 10:    Manufacturer code MSB (0x00)
-        Byte 11:    Manufacturer code LSB (0x00)
+        Byte 6-7:   Body length (length of cEMI data)
+        Byte 8-9:   Protocol ID, big-endian (0x0001 = KNX Tunnel)
+        Byte 10:    EMI type (0x03 = cEMI)
+        Byte 11:    Manufacturer code (0x00)
         Byte 12+:   cEMI data
         Padded to 64 bytes with 0x00
         """
@@ -429,15 +432,15 @@ class KNXUSBTransport:
 
         report = bytearray(HID_REPORT_SIZE)
         report[0] = HID_REPORT_ID
-        report[1] = 0x13  # Single packet, start, end
+        report[1] = 0x01                  # Single complete packet
         struct.pack_into('>H', report, 2, transfer_length)
         report[4] = KNX_USB_PROTOCOL_VERSION
         report[5] = KNX_USB_HEADER_LENGTH
         struct.pack_into('>H', report, 6, body_length)
-        report[8] = 0x01  # Protocol ID: KNX Tunnel
-        report[9] = EMI_CEMI
-        report[10] = 0x00  # Manufacturer MSB
-        report[11] = 0x00  # Manufacturer LSB
+        report[8] = 0x00                  # Protocol ID high byte
+        report[9] = 0x01                  # Protocol ID low byte (0x0001 = KNX Tunnel)
+        report[10] = EMI_CEMI             # EMI type (0x03 = cEMI)
+        report[11] = 0x00                 # Manufacturer code
         report[12:12 + body_length] = cemi_data
 
         return bytes(report)
@@ -459,14 +462,19 @@ class KNXUSBTransport:
         if transfer_length < KNX_USB_HEADER_SIZE:
             return None
 
-        proto_version = report[4]
-        header_length = report[5]
         body_length = struct.unpack_from('>H', report, 6)[0]
-        proto_id = report[8]
-        emi_id = report[9]
+        # Protocol ID is 2-byte big-endian at bytes 8-9
+        proto_id = struct.unpack_from('>H', report, 8)[0]
+        # EMI type is at byte 10 (NOT byte 9)
+        emi_id = report[10]
+
+        if proto_id != 0x0001:  # Not KNX Tunnel
+            if proto_id != 0x0000:  # Don't spam log with idle reports
+                log.debug(f"Non-tunnel report (proto=0x{proto_id:04x} emi=0x{emi_id:02x})")
+            return None
 
         if emi_id != EMI_CEMI:
-            log.debug(f"Non-cEMI report (emi_id=0x{emi_id:02x})")
+            log.debug(f"Non-cEMI tunnel report (emi=0x{emi_id:02x})")
             return None
 
         if body_length == 0:
@@ -479,6 +487,97 @@ class KNXUSBTransport:
             cemi_end = len(report)
 
         return bytes(report[cemi_start:cemi_end])
+
+    # ── Feature Service (device initialization) ────────────────────────
+
+    def _build_feature_report(self, feature_id: int, svc_type: int,
+                              value: bytes = b'') -> bytes:
+        """Build HID report for Feature Service (Protocol ID 0x0004)."""
+        body_length = 1 + len(value)  # feature_id + value
+        transfer_length = KNX_USB_HEADER_SIZE + body_length
+
+        report = bytearray(HID_REPORT_SIZE)
+        report[0] = HID_REPORT_ID
+        report[1] = 0x01
+        struct.pack_into('>H', report, 2, transfer_length)
+        report[4] = KNX_USB_PROTOCOL_VERSION
+        report[5] = KNX_USB_HEADER_LENGTH
+        struct.pack_into('>H', report, 6, body_length)
+        report[8] = 0x00                  # Protocol ID high
+        report[9] = 0x04                  # Protocol ID low (0x0004 = Feature)
+        report[10] = svc_type             # 0x01=Get, 0x03=Set
+        report[11] = 0x00
+        report[12] = feature_id
+        if value:
+            report[13:13 + len(value)] = value
+        return bytes(report)
+
+    def _feature_get(self, feature_id: int) -> Optional[bytes]:
+        """Send Feature Get and wait for Feature Response."""
+        report = self._build_feature_report(feature_id, 0x01)  # Get
+        if not self._write_report(report):
+            log.debug(f"Feature Get 0x{feature_id:02x}: write failed")
+            return None
+
+        for _ in range(10):
+            raw = self._read_report(timeout_ms=500)
+            if raw is None:
+                continue
+            if len(raw) < 13:
+                continue
+            proto_id = struct.unpack_from('>H', raw, 8)[0]
+            svc = raw[10]
+            if proto_id == 0x0004 and svc == 0x02 and raw[12] == feature_id:
+                bl = struct.unpack_from('>H', raw, 6)[0]
+                return bytes(raw[13:12 + bl]) if bl > 1 else bytes()
+
+        log.debug(f"Feature Get 0x{feature_id:02x}: no response")
+        return None
+
+    def _feature_set(self, feature_id: int, value: bytes) -> bool:
+        """Send Feature Set request."""
+        report = self._build_feature_report(feature_id, 0x03, value)  # Set
+        return self._write_report(report)
+
+    def _init_tunnel_mode(self):
+        """Initialize USB device for cEMI tunnel mode via Feature Service."""
+        import time as _time
+        log.info("USB device: initializing cEMI tunnel mode …")
+
+        # Feature Get: Supported EMI types (Feature ID 0x01)
+        supported = self._feature_get(0x01)
+        if supported and len(supported) >= 1:
+            m = supported[0]
+            log.info(f"Supported EMI: 0x{m:02x} "
+                     f"(EMI1={'y' if m & 1 else 'n'} "
+                     f"EMI2={'y' if m & 2 else 'n'} "
+                     f"cEMI={'y' if m & 4 else 'n'})")
+        else:
+            log.info("Could not query supported EMI types — assuming cEMI")
+
+        # Feature Set: Active EMI = cEMI (Feature ID 0x02, value 0x03)
+        if self._feature_set(0x02, bytes([EMI_CEMI])):
+            log.info("Active EMI set to cEMI")
+        else:
+            log.warning("Failed to set active EMI type")
+        _time.sleep(0.1)
+
+        # Feature Get: Individual Address (Feature ID 0x03)
+        addr = self._feature_get(0x03)
+        if addr and len(addr) >= 2:
+            self.individual_addr = (addr[0], addr[1])
+            hi, lo = self.individual_addr
+            log.info(f"Device address: {hi >> 4}.{hi & 0x0F}.{lo}")
+        else:
+            log.info("Could not read individual address — using default")
+
+        # Feature Get: Bus Status (Feature ID 0x05)
+        bus = self._feature_get(0x05)
+        if bus and len(bus) >= 1:
+            up = bus[0] != 0
+            log.info(f"KNX bus: {'connected' if up else 'DISCONNECTED'}")
+        else:
+            log.info("Could not query bus status")
 
     def _write_report(self, report: bytes) -> bool:
         """Write a HID report to the device."""
@@ -559,6 +658,10 @@ class KNXUSBBridge:
         self._send_seq: int = 0
         self._usb_reader_thread: Optional[threading.Thread] = None
         self._tunnel_crd = self.USB_TUNNEL_ADDR
+        # Use device's actual individual address if available
+        if usb_transport.individual_addr:
+            hi, lo = usb_transport.individual_addr
+            self._tunnel_crd = bytes([0x04, 0x04, hi, lo])
 
     def start(self) -> bool:
         """Start the local KNXnet/IP server."""
