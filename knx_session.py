@@ -43,6 +43,8 @@ class Session:
         'last_seen', 'alive', 'created_at',
         'bytes_in', 'bytes_out', 'telegrams_fwd', 'errors',
         'draining', 'drain_event', 'crd', '_backend_ch',
+        '_seq_out_offset', '_seq_in_offset',
+        '_last_out_seq', '_last_in_seq',
     ]
 
     def __init__(self, channel_id: int, client_type: str,
@@ -65,6 +67,10 @@ class Session:
         self.drain_event  = threading.Event()
         self.crd          = None
         self._backend_ch  = channel_id
+        self._seq_out_offset = 0   # subtract from client seq for backend
+        self._seq_in_offset  = 0   # add to backend seq for client
+        self._last_out_seq   = -1  # last raw client TUNNELLING_REQ seq
+        self._last_in_seq    = -1  # last client-facing backend req seq
 
         # Metrics
         self.bytes_in     = 0
@@ -133,6 +139,21 @@ class Session:
                 old_sock.close()
             except Exception:
                 pass
+
+    def reset_seq_for_reconnect(self):
+        """
+        Recalculate sequence counter offsets when the backend is
+        reconnected (SECURE avoidance or hot-swap).  After reconnect
+        the new backend expects seq=0, but the client continues its
+        previous sequence.  These offsets let the proxy rewrite
+        seq counters transparently.
+        """
+        if self._last_out_seq >= 0:
+            self._seq_out_offset = (self._last_out_seq + 1) & 0xFF
+        if self._last_in_seq >= 0:
+            self._seq_in_offset = (self._last_in_seq + 1) & 0xFF
+        log.debug(f"Seq offsets reset: out={self._seq_out_offset} "
+                  f"in={self._seq_in_offset}")
 
     def uptime(self) -> float:
         """Return session uptime in seconds."""

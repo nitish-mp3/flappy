@@ -540,6 +540,7 @@ class KNXProxy:
                 new_ia_str = f"{(n_hi >> 4) & 0xF}.{n_hi & 0xF}.{n_lo}"
 
             sock.settimeout(65.0)
+            sess.reset_seq_for_reconnect()
             sess.swap_backend(sock, proto, (b_host, b_port), ch_id)
             sess.crd = new_crd
 
@@ -627,13 +628,23 @@ class KNXProxy:
                     ack_body = bytes([0x04, body[1], body[2], 0x00])
                     sess.send_to_backend(make_frame(TUNNELLING_ACK, ack_body))
 
-                # Rewrite channel_id for client if backend ch differs
-                if sess._backend_ch != sess.channel_id:
+                # Rewrite channel_id and seq for client if needed
+                if svc in (TUNNELLING_REQ, TUNNELLING_ACK) and len(data) > 8:
+                    needs_ch = sess._backend_ch != sess.channel_id
+                    seq_off = (sess._seq_in_offset if svc == TUNNELLING_REQ
+                               else sess._seq_out_offset)
+                    if needs_ch or seq_off:
+                        data = bytearray(data)
+                        if needs_ch:
+                            data[7] = sess.channel_id
+                        if seq_off:
+                            data[8] = (data[8] + seq_off) & 0xFF
+                        data = bytes(data)
+                    if svc == TUNNELLING_REQ:
+                        sess._last_in_seq = data[8]
+                elif sess._backend_ch != sess.channel_id and len(data) > 6:
                     data = bytearray(data)
-                    if svc in (TUNNELLING_REQ, TUNNELLING_ACK) and len(data) > 7:
-                        data[7] = sess.channel_id
-                    elif len(data) > 6:
-                        data[6] = sess.channel_id
+                    data[6] = sess.channel_id
                     data = bytes(data)
 
                 ok = sess.send_to_client(data, udp_sock)
@@ -642,8 +653,9 @@ class KNXProxy:
                     relay_count += 1
                     if relay_count <= 5 or relay_count % 50 == 0:
                         mc = body[4] if len(body) > 4 else 0
+                        fwd_seq = data[8] if len(data) > 8 else body[2]
                         log.info(f"Relay ch={sess.channel_id}: {svc_name(svc)} "
-                                 f"seq={body[2] if len(body) > 2 else '?'} "
+                                 f"seq={fwd_seq} "
                                  f"mc=0x{mc:02X} len={len(body)} "
                                  f"→client={'OK' if ok else 'FAIL'} "
                                  f"(total={relay_count})")
@@ -752,6 +764,7 @@ class KNXProxy:
         bsock.settimeout(65.0)
 
         # Swap the backend in-place
+        sess.reset_seq_for_reconnect()
         sess.swap_backend(bsock, b_proto, (b_host, b_port), ch_id)
 
     # ──────────────────────────────────────────────────────────────────
@@ -840,10 +853,18 @@ class KNXProxy:
             sess = self.sessions.get(ch)
             if sess and sess.alive:
                 sess.last_seen = time.monotonic()
+                if svc == TUNNELLING_REQ:
+                    sess._last_out_seq = body[2]
                 fwd = data
-                if sess._backend_ch != sess.channel_id and len(fwd) > 7:
+                needs_ch = sess._backend_ch != sess.channel_id
+                seq_off = (sess._seq_out_offset if svc == TUNNELLING_REQ
+                           else sess._seq_in_offset)
+                if (needs_ch or seq_off) and len(fwd) > 8:
                     fwd = bytearray(fwd)
-                    fwd[7] = sess._backend_ch
+                    if needs_ch:
+                        fwd[7] = sess._backend_ch
+                    if seq_off:
+                        fwd[8] = (fwd[8] - seq_off) & 0xFF
                     fwd = bytes(fwd)
                 sess.send_to_backend(fwd)
                 sess.telegrams_fwd += 1
@@ -1059,17 +1080,27 @@ class KNXProxy:
                                 sock.sendall(make_frame(TUNNELLING_ACK, ack_body))
                             except Exception:
                                 pass
-                        # Rewrite channel_id for backend if it differs
+                        # Rewrite channel_id and seq for backend
                         fwd_body = body
-                        if sess._backend_ch != sess.channel_id:
+                        needs_ch = sess._backend_ch != sess.channel_id
+                        if svc == TUNNELLING_REQ:
+                            sess._last_out_seq = body[2]
+                            seq_off = sess._seq_out_offset
+                        else:
+                            seq_off = sess._seq_in_offset
+                        if needs_ch or seq_off:
                             fwd_body = bytearray(body)
-                            fwd_body[1] = sess._backend_ch
+                            if needs_ch:
+                                fwd_body[1] = sess._backend_ch
+                            if seq_off:
+                                fwd_body[2] = (body[2] - seq_off) & 0xFF
                             fwd_body = bytes(fwd_body)
                         ok = sess.send_to_backend(make_frame(svc, fwd_body))
                         if svc == TUNNELLING_REQ:
                             sess.telegrams_fwd += 1
+                            b_seq = fwd_body[2] if isinstance(fwd_body, (bytearray, bytes)) else body[2]
                             log.info(f"Client→Backend ch={ch}: "
-                                     f"seq={body[2]} len={len(body)} "
+                                     f"seq={body[2]}→{b_seq} len={len(body)} "
                                      f"fwd={'OK' if ok else 'FAIL'}")
                     else:
                         log.warning(f"No session for {svc_name(svc)} "
