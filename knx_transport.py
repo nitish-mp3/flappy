@@ -218,12 +218,22 @@ class BackendConnector:
             make_frame, make_hpai, parse_hpai, read_tcp_frame,
         )
 
-        # TCP: 2 attempts max.  First attempt reuses the caller's socket;
+        # TCP: build attempt list.  First attempt reuses the caller's socket;
         # subsequent attempts open fresh sockets (KNXnet/IP TCP only allows
         # ONE CONNECT per connection — after rejection state is undefined).
-        tcp_attempts = [
-            (True, CRI_TUNNEL_V1, 'tcp-zero+v1'),    # zero HPAI
-            (False, CRI_TUNNEL_V1, 'tcp-local+v1'),  # NAT HPAI
+        #
+        # CRITICAL: forward the CLIENT's CRI to the backend first.
+        # xknx may send an extended 6-byte CRI that requests a specific
+        # individual address / tunnel slot (e.g. 1.1.254 non-secure) while
+        # our default CRI_TUNNEL_V1 is generic and the device may assign the
+        # "secure" fallback slot (e.g. 1.1.255) which wraps all data in
+        # SECURE_WRAPPER — causing zero telegrams received.
+        tcp_attempts = []
+        if client_cri and len(client_cri) >= 4:
+            tcp_attempts.append((True, client_cri, 'tcp-zero+client-cri'))
+        tcp_attempts += [
+            (True, CRI_TUNNEL_V1, 'tcp-zero+v1'),    # zero HPAI, generic CRI
+            (False, CRI_TUNNEL_V1, 'tcp-local+v1'),  # NAT HPAI, generic CRI
         ]
 
         last_status = None
@@ -271,7 +281,8 @@ class BackendConnector:
                     if r_off < len(rbody): crd = rbody[r_off:]
                 elif len(rbody) > 2:
                     crd = rbody[2:]
-                log.info(f"Backend CONNECT accepted ({label}) ch={ch_id}")
+                log.info(f"Backend CONNECT accepted ({label}) ch={ch_id} "
+                         f"cri={cri.hex()}")
                 self._last_good_sock = sock
                 return ch_id, crd, 0x00
 

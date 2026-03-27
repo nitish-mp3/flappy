@@ -444,6 +444,7 @@ class KNXProxy:
         """Read frames from backend and forward to client."""
         udp_sock = self.udp.sock if self.udp else None
         relay_count = 0
+        secure_warned = False
         log.info(f"Relay thread started for ch={sess.channel_id} "
                  f"backend={sess.backend_addr} type={sess.backend_type}")
 
@@ -475,7 +476,25 @@ class KNXProxy:
             sess.last_seen = time.monotonic()
             dest = sess.client_data or sess.client_ctrl
 
-            if svc in (TUNNELLING_REQ, TUNNELLING_ACK, CONNSTATE_RESP, DISCONNECT_RESP):
+            if svc == SECURE_WRAPPER:
+                # Backend uses KNX IP Secure — forward wrapped frames to
+                # client so xknx can decrypt them (when configured for
+                # secure tunnelling).
+                if not secure_warned:
+                    secure_warned = True
+                    log.warning(
+                        f"Session ch={sess.channel_id}: backend sends "
+                        f"SECURE_WRAPPER — KNX IP Secure is active on "
+                        f"{sess.backend_addr[0]}:{sess.backend_addr[1]}. "
+                        f"Configure HA KNX integration for 'KNX IP Secure "
+                        f"Tunnelling' with the device authentication code "
+                        f"and user password from ETS, or disable KNX IP "
+                        f"Secure in ETS project."
+                    )
+                sess.send_to_client(data, udp_sock)
+                sess.telegrams_fwd += 1
+
+            elif svc in (TUNNELLING_REQ, TUNNELLING_ACK, CONNSTATE_RESP, DISCONNECT_RESP):
                 # Immediately ACK incoming TUNNELLING_REQ from backend
                 # so it doesn't time out waiting for the full client round-trip
                 if svc == TUNNELLING_REQ:
