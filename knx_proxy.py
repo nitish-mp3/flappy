@@ -290,10 +290,22 @@ class KNXProxy:
             log.error("KNX IP Secure requested but cryptography library not available")
             return None
 
+        # Disable Nagle for low-latency framing (asyncio does this by default)
+        try:
+            bsock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
         sec = SecureSession(device_pw, user_pw, user_id)
+        log.debug(f"Secure handshake: device_pw len={len(device_pw)}, "
+                  f"user_pw len={len(user_pw)}, user_id={user_id}")
+        if sec._device_pwd_hash:
+            log.debug(f"Secure handshake: device_pwd_hash={sec._device_pwd_hash[:4].hex()}..")
+        log.debug(f"Secure handshake: user_pwd_hash={sec._user_pwd_hash[:4].hex()}..")
 
         # 1. SESSION_REQUEST
         req_frame = sec.build_session_request()
+        log.debug(f"Secure handshake: SESSION_REQUEST len={len(req_frame)}")
         try:
             bsock.sendall(req_frame)
         except Exception as e:
@@ -302,7 +314,7 @@ class KNXProxy:
 
         # 2. SESSION_RESPONSE
         try:
-            bsock.settimeout(5.0)
+            bsock.settimeout(10.0)
             svc, body = read_tcp_frame(bsock)
         except Exception as e:
             log.error(f"Secure handshake: failed to read SESSION_RESPONSE: {e}")
@@ -318,24 +330,35 @@ class KNXProxy:
             return None
 
         log.info(f"Secure handshake: key exchange OK, session_id={sec.session_id}")
+        log.debug(f"Secure handshake: session_key={sec.session_key[:4].hex()}.., "
+                  f"pub_keys_xor={sec._pub_keys_xor[:4].hex()}..")
 
         # 3. SESSION_AUTHENTICATE — must be wrapped in SECURE_WRAPPER
         #    Per KNX AN159: after key exchange, ALL frames use SECURE_WRAPPER
         auth_frame = sec.build_session_authenticate()
+        log.debug(f"Secure handshake: auth_frame len={len(auth_frame)} "
+                  f"hex={auth_frame[:8].hex()}..{auth_frame[-4:].hex()}")
         wrapped_auth = sec.encrypt_frame(auth_frame)
+        log.debug(f"Secure handshake: wrapped len={len(wrapped_auth)} "
+                  f"hex={wrapped_auth[:16].hex()}..{wrapped_auth[-4:].hex()}")
         try:
             bsock.sendall(wrapped_auth)
+            log.debug(f"Secure handshake: sent {len(wrapped_auth)} bytes "
+                      f"SESSION_AUTHENTICATE (wrapped)")
         except Exception as e:
             log.error(f"Secure handshake: failed to send SESSION_AUTHENTICATE: {e}")
             return None
 
         # 4. SESSION_STATUS — comes back in SECURE_WRAPPER
         try:
-            bsock.settimeout(5.0)
+            bsock.settimeout(10.0)
             svc, body = read_tcp_frame(bsock)
         except Exception as e:
             log.error(f"Secure handshake: failed to read SESSION_STATUS: {e}")
             return None
+
+        log.debug(f"Secure handshake: got response svc={hex(svc) if svc else 'None'} "
+                  f"body_len={len(body) if body else 0}")
 
         if svc == SECURE_WRAPPER and body is not None:
             inner = sec.decrypt_frame(body)

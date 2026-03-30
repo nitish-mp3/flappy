@@ -29,7 +29,7 @@ try:
         X25519PrivateKey, X25519PublicKey
     )
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import serialization
     _SECURE_AVAILABLE = True
     log.info("KNX IP Secure: cryptography library available")
 except ImportError:
@@ -79,9 +79,7 @@ def _bytes_xor(a: bytes, b: bytes) -> bytes:
 
 def _sha256(data: bytes) -> bytes:
     """SHA-256 hash."""
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(data)
-    return digest.finalize()
+    return hashlib.sha256(data).digest()
 
 
 def _cbc_mac(key: bytes, additional_data: bytes,

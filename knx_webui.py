@@ -29,7 +29,7 @@ STATE_FILE = "/run/knx-failover.state"
 METRICS_FILE = "/run/knx-metrics.json"
 BACKEND_FILE = "/run/knx-active-backend"
 WWW_DIR = "/www"
-VERSION = "4.3.9"
+VERSION = "4.3.10"
 
 SUPERVISOR_TOKEN = os.environ.get('SUPERVISOR_TOKEN', '')
 
