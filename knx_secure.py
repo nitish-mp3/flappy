@@ -4,18 +4,18 @@ KNX IP Secure — Session Authentication & Encryption
 =====================================================
 Implements KNX IP Secure tunneling protocol:
   - ECDH Curve25519 key exchange
-  - AES-128-CCM message encryption/decryption
+  - AES-128-CBC-MAC + AES-128-CTR message authentication & encryption
   - Session authentication flow
   - Secure wrapper framing
+
+Crypto matches the xknx reference implementation and KNX AN159 spec.
 
 This module is optional — if py3-cryptography is not installed,
 the proxy operates in non-secure mode only.
 """
 
-import os
 import struct
 import hashlib
-import hmac
 import logging
 import time
 from typing import Optional, Tuple
@@ -28,8 +28,8 @@ try:
     from cryptography.hazmat.primitives.asymmetric.x25519 import (
         X25519PrivateKey, X25519PublicKey
     )
-    from cryptography.hazmat.primitives.ciphers.aead import AESCCM
-    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import hashes, serialization
     _SECURE_AVAILABLE = True
     log.info("KNX IP Secure: cryptography library available")
 except ImportError:
@@ -49,12 +49,90 @@ SESSION_AUTHENTICATE_SVC  = 0x0953
 SESSION_STATUS_SVC        = 0x0954
 TIMER_NOTIFY_SVC          = 0x0955
 
-# AES-128-CCM parameters per KNX spec
-CCM_TAG_LENGTH = 16   # 128-bit MAC
-CCM_NONCE_LENGTH = 13
+MAC_LENGTH = 16  # 128-bit MAC
+SERIAL_NUMBER = bytes(6)  # placeholder serial
+MESSAGE_TAG_TUNNELLING = b'\x00\x00'  # 2-byte message tag for tunneling
 
-# Key derivation label for session keys
-SESSION_KEY_LABEL = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
+# Used as CTR counter_0 during SESSION_RESPONSE / SESSION_AUTHENTICATE
+COUNTER_0_HANDSHAKE = (
+    b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\x00'
+)
+
+# Fixed KNXnet/IP headers for MAC additional_data computation
+_HEADER_SESSION_RESPONSE     = b'\x06\x10\x09\x52\x00\x38'  # 56 bytes total
+_HEADER_SESSION_AUTHENTICATE = b'\x06\x10\x09\x53\x00\x18'  # 24 bytes total
+
+
+# ── Crypto helpers (matching xknx security_primitives) ────────────────
+
+def _byte_pad(data: bytes, block_size: int) -> bytes:
+    """Pad data with 0x00 to a multiple of block_size."""
+    if remainder := len(data) % block_size:
+        return data + bytes(block_size - remainder)
+    return data
+
+
+def _bytes_xor(a: bytes, b: bytes) -> bytes:
+    """XOR two equal-length byte strings."""
+    return (int.from_bytes(a, 'big') ^ int.from_bytes(b, 'big')).to_bytes(len(a), 'big')
+
+
+def _sha256(data: bytes) -> bytes:
+    """SHA-256 hash."""
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(data)
+    return digest.finalize()
+
+
+def _cbc_mac(key: bytes, additional_data: bytes,
+             payload: bytes = b'', block_0: bytes = bytes(16)) -> bytes:
+    """
+    AES-128-CBC-MAC per KNX spec.
+    Blocks = block_0 || len(additional_data) || additional_data || payload
+    Pad to AES block boundary, then AES-CBC encrypt — MAC is last 16 bytes.
+    """
+    blocks = block_0 + len(additional_data).to_bytes(2, 'big') + additional_data + payload
+    cipher = Cipher(algorithms.AES(key), modes.CBC(bytes(16)))
+    enc = cipher.encryptor()
+    ct = enc.update(_byte_pad(blocks, 16)) + enc.finalize()
+    return ct[-16:]
+
+
+def _encrypt_ctr(key: bytes, counter_0: bytes,
+                 mac_cbc: bytes, payload: bytes = b'') -> Tuple[bytes, bytes]:
+    """
+    AES-128-CTR encryption.
+    MAC is encrypted first (counter 0), then payload (counter 1+).
+    Returns (encrypted_data, encrypted_mac).
+    """
+    cipher = Cipher(algorithms.AES(key), modes.CTR(counter_0))
+    enc = cipher.encryptor()
+    mac = enc.update(mac_cbc)
+    encrypted_data = enc.update(payload) + enc.finalize()
+    return encrypted_data, mac
+
+
+def _decrypt_ctr(key: bytes, counter_0: bytes,
+                 mac: bytes, payload: bytes = b'') -> Tuple[bytes, bytes]:
+    """
+    AES-128-CTR decryption.
+    MAC is decrypted first (counter 0), then payload (counter 1+).
+    Returns (decrypted_data, decrypted_mac).
+    """
+    cipher = Cipher(algorithms.AES(key), modes.CTR(counter_0))
+    dec = cipher.decryptor()
+    mac_tr = dec.update(mac)
+    decrypted_data = dec.update(payload) + dec.finalize()
+    return decrypted_data, mac_tr
+
+
+def _derive_password(password: str, is_device_auth: bool) -> bytes:
+    """PBKDF2-HMAC-SHA256 with KNX-spec salt, 65536 iterations, 16-byte output."""
+    if is_device_auth:
+        salt = b'device-authentication-code.1.secure.ip.knx.org'
+    else:
+        salt = b'user-password.1.secure.ip.knx.org'
+    return hashlib.pbkdf2_hmac('sha256', password.encode('latin-1'), salt, 65536, dklen=16)
 
 
 class SecureSession:
@@ -64,9 +142,9 @@ class SecureSession:
     Handles the full lifecycle:
     1. Generate ECDH keypair
     2. Exchange public keys with peer
-    3. Derive shared session key
-    4. Authenticate using device/user password
-    5. Encrypt/decrypt tunnel frames
+    3. Derive shared session key (SHA-256 of ECDH shared secret)
+    4. Authenticate using device/user password (AES-CBC-MAC + AES-CTR)
+    5. Encrypt/decrypt tunnel frames (SECURE_WRAPPER)
     """
 
     def __init__(self, device_password: str = "", user_password: str = "",
@@ -74,8 +152,14 @@ class SecureSession:
         if not _SECURE_AVAILABLE:
             raise RuntimeError("Cryptography library not installed")
 
-        self.device_password = device_password.encode('utf-8') if device_password else b''
-        self.user_password = user_password.encode('utf-8') if user_password else b''
+        self._device_pwd_hash = (
+            _derive_password(device_password, is_device_auth=True)
+            if device_password else None
+        )
+        self._user_pwd_hash = (
+            _derive_password(user_password, is_device_auth=False)
+            if user_password else bytes(16)
+        )
         self.user_id = user_id
 
         # ECDH keypair
@@ -88,44 +172,31 @@ class SecureSession:
         # Session state
         self.session_id: int = 0
         self.peer_public_key: Optional[bytes] = None
+        self._pub_keys_xor: Optional[bytes] = None
         self.session_key: Optional[bytes] = None
         self.authenticated: bool = False
 
-        # Sequence counters for replay protection
+        # Sequence counters
         self.tx_seq: int = 0
-        self.rx_seq: int = 0
+        self.rx_seq: int = -1  # accept first frame with seq=0
 
         # Timestamps
         self.created_at = time.monotonic()
         self.last_activity = time.monotonic()
 
-    def derive_session_key(self, peer_pub_bytes: bytes) -> bytes:
-        """
-        Derive session key from ECDH shared secret.
-        Uses HKDF-like derivation per KNX spec.
-        """
+    def _derive_session_key(self, peer_pub_bytes: bytes) -> bytes:
+        """Derive session key: SHA-256(ECDH shared secret)[:16]."""
         self.peer_public_key = peer_pub_bytes
+        self._pub_keys_xor = _bytes_xor(self.public_key, peer_pub_bytes)
         peer_key = X25519PublicKey.from_public_bytes(peer_pub_bytes)
         shared_secret = self._private_key.exchange(peer_key)
 
-        # KNX uses a simplified key derivation: first 16 bytes of
-        # HMAC-SHA256(shared_secret, label)
-        key_material = hmac.new(
-            shared_secret,
-            SESSION_KEY_LABEL,
-            hashlib.sha256
-        ).digest()
-
-        self.session_key = key_material[:16]  # AES-128 key
+        self.session_key = _sha256(shared_secret)[:16]
         log.debug(f"Session key derived for session {self.session_id}")
         return self.session_key
 
     def build_session_request(self) -> bytes:
-        """
-        Build a SESSION_REQUEST frame body.
-        Contains our ECDH public key (32 bytes).
-        """
-        # [HPAI control endpoint] [ECDH Client Public Value]
+        """Build a SESSION_REQUEST frame (ECDH public key)."""
         from knx_const import make_hpai, make_frame, PROTO_TCP
         hpai = make_hpai('0.0.0.0', 0, PROTO_TCP)
         body = hpai + self.public_key
@@ -135,7 +206,9 @@ class SecureSession:
         """
         Process a SESSION_RESPONSE from the server.
         Extracts session_id and server's ECDH public key.
-        Returns True if key derivation succeeds.
+        Derives session key from ECDH shared secret.
+        Verifies server MAC using device authentication password.
+        Returns True on success.
         """
         if len(body) < 34:
             log.error(f"SESSION_RESPONSE too short: {len(body)} bytes")
@@ -145,53 +218,79 @@ class SecureSession:
         server_pub_key = body[2:34]
 
         try:
-            self.derive_session_key(server_pub_key)
-            # The remaining bytes (34+) are the encrypted MAC for verification
-            if len(body) > 34:
-                encrypted_mac = body[34:]
-                if not self._verify_server_mac(encrypted_mac):
-                    log.warning("Server MAC verification failed")
-                    return False
-            log.info(f"Secure session {self.session_id} key exchange complete")
-            return True
+            self._derive_session_key(server_pub_key)
         except Exception as e:
             log.error(f"Session key derivation failed: {e}")
             return False
 
+        # Verify server MAC (device authentication)
+        if len(body) >= 50 and self._device_pwd_hash:
+            encrypted_mac = body[34:50]
+            # Compute expected MAC
+            additional = (
+                _HEADER_SESSION_RESPONSE
+                + struct.pack('>H', self.session_id)
+                + self._pub_keys_xor
+            )
+            expected_mac = _cbc_mac(
+                key=self._device_pwd_hash,
+                additional_data=additional,
+            )
+            # Decrypt received MAC
+            _, mac_tr = _decrypt_ctr(
+                key=self._device_pwd_hash,
+                counter_0=COUNTER_0_HANDSHAKE,
+                mac=encrypted_mac,
+            )
+            if mac_tr != expected_mac:
+                log.warning("Server MAC verification failed — "
+                            "check device_authentication_password")
+                # Continue anyway for compatibility — some gateways
+                # have quirks. The session will fail at authenticate
+                # if passwords are truly wrong.
+        elif len(body) >= 50:
+            log.debug("No device password — skipping server MAC verification")
+        else:
+            log.debug("No server MAC in SESSION_RESPONSE")
+
+        log.info(f"Secure session {self.session_id} key exchange complete")
+        return True
+
     def build_session_authenticate(self) -> bytes:
         """
         Build a SESSION_AUTHENTICATE frame.
-        Uses user_password (for tunnelling) to create authentication MAC.
+        MAC computed with AES-CBC-MAC using user_password hash,
+        then encrypted with AES-CTR.
         """
         if not self.session_key:
             raise RuntimeError("Session key not derived yet")
 
         from knx_const import make_frame
 
-        # user_id 0 = management (device auth), 1+ = tunnelling users
-        user_id = self.user_id
+        # additional_data: header + reserved(0x00) + user_id + XOR(pub_keys)
+        additional = (
+            _HEADER_SESSION_AUTHENTICATE
+            + bytes([0x00, self.user_id])
+            + (self._pub_keys_xor or bytes(32))
+        )
 
-        # Authenticate using user password (not device password)
-        if self.user_password:
-            pwd_hash = self._password_hash(self.user_password, is_device_auth=False)
-        else:
-            pwd_hash = bytes(16)
+        mac_cbc = _cbc_mac(
+            key=self._user_pwd_hash,
+            additional_data=additional,
+            block_0=bytes(16),
+        )
 
-        # Build the MAC over session params
-        mac_data = struct.pack('>H', self.session_id)
-        mac_data += self.public_key
-        mac_data += (self.peer_public_key or bytes(32))
+        _, authenticate_mac = _encrypt_ctr(
+            key=self._user_pwd_hash,
+            counter_0=COUNTER_0_HANDSHAKE,
+            mac_cbc=mac_cbc,
+        )
 
-        mac = self._compute_mac(pwd_hash, mac_data)
-
-        body = bytes([user_id, 0x00]) + mac
+        body = bytes([self.user_id, 0x00]) + authenticate_mac
         return make_frame(SESSION_AUTHENTICATE_SVC, body)
 
     def process_session_status(self, body: bytes) -> bool:
-        """
-        Process SESSION_STATUS response.
-        Returns True if authentication succeeded (status = 0x00).
-        """
+        """Process SESSION_STATUS. Returns True if status == 0x00."""
         if len(body) < 1:
             log.error("SESSION_STATUS body empty")
             return False
@@ -207,124 +306,108 @@ class SecureSession:
 
     def encrypt_frame(self, plaintext: bytes) -> bytes:
         """
-        Encrypt a KNXnet/IP frame payload using AES-128-CCM.
-        Returns the SECURE_WRAPPER frame.
+        Encrypt a KNXnet/IP frame into a SECURE_WRAPPER.
+        Uses AES-128-CBC-MAC + AES-128-CTR (per KNX spec).
         """
-        if not self.session_key or not self.authenticated:
-            raise RuntimeError("Session not authenticated")
+        if not self.session_key:
+            raise RuntimeError("Session key not derived yet")
 
-        from knx_const import make_frame
-
+        seq_info = self.tx_seq.to_bytes(6, 'big')
         self.tx_seq += 1
 
-        # Build nonce: session_id (2) + timer (6) + serial (6) + tag (1)
-        # Simplified: use seq number as nonce source
-        nonce = self._build_nonce(self.tx_seq)
+        payload_length = len(plaintext)
+        # Total: 6 header + 2 session_id + 6 seq + 6 serial + 2 tag + N data + 16 MAC
+        total_length = 38 + payload_length
+        wrapper_header = struct.pack('>BBHH', 0x06, 0x10,
+                                     SECURE_WRAPPER_SVC, total_length)
+        session_id_bytes = struct.pack('>H', self.session_id)
 
-        aesccm = AESCCM(self.session_key, tag_length=CCM_TAG_LENGTH)
-        ciphertext = aesccm.encrypt(nonce, plaintext, None)
+        # CBC-MAC
+        block_0 = (seq_info + SERIAL_NUMBER + MESSAGE_TAG_TUNNELLING
+                    + struct.pack('>H', payload_length))
+        mac_cbc = _cbc_mac(
+            key=self.session_key,
+            additional_data=wrapper_header + session_id_bytes,
+            payload=plaintext,
+            block_0=block_0,
+        )
 
-        # SECURE_WRAPPER: [session_id (2)][seq (6)][serial (6)][tag (1)][ciphertext]
-        wrapper_body = struct.pack('>H', self.session_id)
-        wrapper_body += struct.pack('>Q', self.tx_seq)[2:]  # 6-byte seq
-        wrapper_body += bytes(6)  # serial number placeholder
-        wrapper_body += bytes([0x00])  # message tag
-        wrapper_body += ciphertext
+        # CTR encryption
+        counter_0 = seq_info + SERIAL_NUMBER + MESSAGE_TAG_TUNNELLING + b'\xff\x00'
+        encrypted_data, mac = _encrypt_ctr(
+            key=self.session_key,
+            counter_0=counter_0,
+            mac_cbc=mac_cbc,
+            payload=plaintext,
+        )
 
         self.last_activity = time.monotonic()
-        return make_frame(SECURE_WRAPPER_SVC, wrapper_body)
+        return (wrapper_header + session_id_bytes + seq_info
+                + SERIAL_NUMBER + MESSAGE_TAG_TUNNELLING
+                + encrypted_data + mac)
 
     def decrypt_frame(self, body: bytes) -> Optional[bytes]:
         """
         Decrypt a SECURE_WRAPPER frame body.
         Returns the inner plaintext KNXnet/IP payload, or None on failure.
         """
-        if not self.session_key or not self.authenticated:
-            log.warning("Decrypt called on unauthenticated session")
+        if not self.session_key:
+            log.warning("Decrypt called without session key")
             return None
 
-        if len(body) < 17:  # minimum: 2 + 6 + 6 + 1 + CCM_TAG_LENGTH
+        # Minimum: session_id(2) + seq(6) + serial(6) + tag(2) + mac(16) = 32
+        if len(body) < 32:
             log.warning(f"SECURE_WRAPPER body too short: {len(body)}")
             return None
 
         session_id = struct.unpack('>H', body[0:2])[0]
         if session_id != self.session_id:
-            log.warning(f"Session ID mismatch: expected {self.session_id}, got {session_id}")
+            log.warning(f"Session ID mismatch: expected {self.session_id}, "
+                        f"got {session_id}")
             return None
 
-        seq_bytes = body[2:8]
-        seq = struct.unpack('>Q', b'\x00\x00' + seq_bytes)[0]
+        seq_info = body[2:8]
+        seq = int.from_bytes(seq_info, 'big')
+        serial = body[8:14]
+        msg_tag = body[14:16]
+        encrypted_data = body[16:-16] if len(body) > 32 else b''
+        mac = body[-16:]
 
         # Replay protection
         if seq <= self.rx_seq:
             log.warning(f"Replay detected: rx_seq={self.rx_seq}, got={seq}")
             return None
 
-        ciphertext = body[15:]  # after session_id(2) + seq(6) + serial(6) + tag(1)
-        nonce = self._build_nonce(seq)
-
-        try:
-            aesccm = AESCCM(self.session_key, tag_length=CCM_TAG_LENGTH)
-            plaintext = aesccm.decrypt(nonce, ciphertext, None)
-            self.rx_seq = seq
-            self.last_activity = time.monotonic()
-            return plaintext
-        except Exception as e:
-            log.error(f"Decryption failed: {e}")
-            return None
-
-    def _build_nonce(self, seq: int) -> bytes:
-        """Build a 13-byte nonce for AES-128-CCM."""
-        # [session_id (2)][zeros (5)][seq (6)]
-        nonce = struct.pack('>H', self.session_id)
-        nonce += bytes(5)
-        nonce += struct.pack('>Q', seq)[2:]  # 6-byte seq
-        return nonce
-
-    def _compute_mac(self, key: bytes, data: bytes) -> bytes:
-        """Compute HMAC-SHA256 truncated to 16 bytes (for auth)."""
-        return hmac.new(key, data, hashlib.sha256).digest()[:16]
-
-    def _password_hash(self, password: bytes, is_device_auth: bool = False) -> bytes:
-        """
-        Hash a password per KNX spec.
-        PBKDF2-HMAC-SHA256 with spec-defined salt and 65536 iterations.
-
-        Device authentication code and user password use different salts.
-        """
-        if is_device_auth:
-            salt = b'device-authentication-code.1.secure.ip.knx.org'
-        else:
-            salt = b'user-password.1.secure.ip.knx.org'
-        return hashlib.pbkdf2_hmac(
-            'sha256',
-            password,
-            salt,
-            65536,
-            dklen=16
+        # CTR decrypt
+        counter_0 = seq_info + serial + msg_tag + b'\xff\x00'
+        decrypted_data, mac_tr = _decrypt_ctr(
+            key=self.session_key,
+            counter_0=counter_0,
+            mac=mac,
+            payload=encrypted_data,
         )
 
-    def _verify_server_mac(self, encrypted_mac: bytes) -> bool:
-        """
-        Verify the server's MAC in the SESSION_RESPONSE.
-        Returns True if valid (or if we can't verify — fail-open for compat).
-        """
-        if not self.session_key:
-            return False
-        # In production, this should verify the server's identity.
-        # For maximum compatibility with different KNX gateway firmware,
-        # we accept any MAC if we have a valid session key.
-        if len(encrypted_mac) < CCM_TAG_LENGTH:
-            log.debug("Server MAC too short — accepting (compatibility mode)")
-            return True
-        try:
-            nonce = self._build_nonce(0)
-            aesccm = AESCCM(self.session_key, tag_length=CCM_TAG_LENGTH)
-            aesccm.decrypt(nonce, encrypted_mac, None)
-            return True
-        except Exception:
-            log.debug("Server MAC decrypt failed — accepting (compatibility mode)")
-            return True
+        # Verify CBC-MAC
+        total_length = 6 + len(body)
+        wrapper_header = struct.pack('>BBHH', 0x06, 0x10,
+                                     SECURE_WRAPPER_SVC, total_length)
+        block_0 = (seq_info + serial + msg_tag
+                    + struct.pack('>H', len(decrypted_data)))
+        mac_cbc = _cbc_mac(
+            key=self.session_key,
+            additional_data=wrapper_header + body[0:2],
+            payload=decrypted_data,
+            block_0=block_0,
+        )
+
+        if mac_cbc != mac_tr:
+            log.warning(f"SECURE_WRAPPER MAC verification failed "
+                        f"(session={self.session_id}, seq={seq})")
+            return None
+
+        self.rx_seq = seq
+        self.last_activity = time.monotonic()
+        return decrypted_data
 
     def close(self):
         """Clean up session resources."""

@@ -63,6 +63,10 @@ DRAIN_TIMEOUT    = int(os.environ.get('DRAIN_TIMEOUT', '5'))
 # Secure config
 PRIMARY_SECURE      = os.environ.get('PRIMARY_SECURE', 'false').lower() == 'true'
 BACKUP_SECURE       = os.environ.get('BACKUP_SECURE', 'false').lower() == 'true'
+PRIMARY_HOST        = os.environ.get('PRIMARY_HOST', '')
+PRIMARY_PORT        = int(os.environ.get('PRIMARY_PORT', '3671'))
+BACKUP_HOST         = os.environ.get('BACKUP_HOST', '')
+BACKUP_PORT         = int(os.environ.get('BACKUP_PORT', '3671'))
 PRIMARY_DEVICE_PW   = os.environ.get('PRIMARY_DEVICE_PASSWORD', '')
 PRIMARY_USER_PW     = os.environ.get('PRIMARY_USER_PASSWORD', '')
 PRIMARY_USER_ID     = int(os.environ.get('PRIMARY_USER_ID', '1'))
@@ -261,17 +265,11 @@ class KNXProxy:
 
     def _get_secure_config(self, host: str, port: int) -> Tuple[bool, str, str, int]:
         """Determine if a backend should use secure mode."""
-        backend = read_backend()
-        if backend is None:
-            return False, '', '', 1
-
-        b_host, b_port, _ = backend
-
-        # Check primary
-        if PRIMARY_SECURE and b_host == host:
+        # Check against configured primary host/port
+        if PRIMARY_SECURE and host == PRIMARY_HOST and port == PRIMARY_PORT:
             return True, PRIMARY_DEVICE_PW, PRIMARY_USER_PW, PRIMARY_USER_ID
-        # Check backup
-        if BACKUP_SECURE and b_host == host:
+        # Check against configured backup host/port
+        if BACKUP_SECURE and host == BACKUP_HOST and port == BACKUP_PORT:
             return True, BACKUP_DEVICE_PW, BACKUP_USER_PW, BACKUP_USER_ID
 
         return False, '', '', 1
@@ -321,21 +319,30 @@ class KNXProxy:
 
         log.info(f"Secure handshake: key exchange OK, session_id={sec.session_id}")
 
-        # 3. SESSION_AUTHENTICATE
+        # 3. SESSION_AUTHENTICATE — must be wrapped in SECURE_WRAPPER
+        #    Per KNX AN159: after key exchange, ALL frames use SECURE_WRAPPER
         auth_frame = sec.build_session_authenticate()
+        wrapped_auth = sec.encrypt_frame(auth_frame)
         try:
-            bsock.sendall(auth_frame)
+            bsock.sendall(wrapped_auth)
         except Exception as e:
             log.error(f"Secure handshake: failed to send SESSION_AUTHENTICATE: {e}")
             return None
 
-        # 4. SESSION_STATUS
+        # 4. SESSION_STATUS — comes back in SECURE_WRAPPER
         try:
             bsock.settimeout(5.0)
             svc, body = read_tcp_frame(bsock)
         except Exception as e:
             log.error(f"Secure handshake: failed to read SESSION_STATUS: {e}")
             return None
+
+        if svc == SECURE_WRAPPER and body is not None:
+            inner = sec.decrypt_frame(body)
+            if inner is None:
+                log.error("Secure handshake: failed to decrypt SESSION_STATUS wrapper")
+                return None
+            svc, body = parse_frame(inner)
 
         if svc != SECURE_SESSION_STATUS or body is None:
             log.error(f"Secure handshake: expected SESSION_STATUS (0x0954), "

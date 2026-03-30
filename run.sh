@@ -22,7 +22,7 @@ readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly WEBUI_PID_FILE="/run/knx-webui.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="4.3.8"
+readonly VERSION="4.3.9"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -330,6 +330,10 @@ start_proxy() {
     DRAIN_TIMEOUT="$DRAIN_TIMEOUT" \
     PRIMARY_SECURE="$PRIMARY_SECURE" \
     BACKUP_SECURE="$BACKUP_SECURE" \
+    PRIMARY_HOST="$PRIMARY_HOST" \
+    PRIMARY_PORT="$PRIMARY_PORT" \
+    BACKUP_HOST="$BACKUP_HOST" \
+    BACKUP_PORT="$BACKUP_PORT" \
     PRIMARY_DEVICE_PASSWORD="$PRIMARY_DEVICE_PW" \
     PRIMARY_USER_PASSWORD="$PRIMARY_USER_PW" \
     PRIMARY_USER_ID="$PRIMARY_USER_ID" \
