@@ -284,7 +284,7 @@ class SecureSession:
             mac_cbc=mac_cbc,
         )
 
-        body = bytes([self.user_id, 0x00]) + authenticate_mac
+        body = bytes([0x00, self.user_id]) + authenticate_mac
         return make_frame(SESSION_AUTHENTICATE_SVC, body)
 
     def process_session_status(self, body: bytes) -> bool:
