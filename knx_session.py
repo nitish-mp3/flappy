@@ -46,6 +46,7 @@ class Session:
         '_seq_out_offset', '_seq_in_offset',
         '_last_out_seq', '_last_in_seq',
         '_client_ia', '_backend_ia',
+        '_secure_session',
     ]
 
     def __init__(self, channel_id: int, client_type: str,
@@ -74,6 +75,7 @@ class Session:
         self._last_in_seq    = -1  # last client-facing backend req seq
         self._client_ia      = None  # (hi, lo) IA told to client in CONNECT_RESP
         self._backend_ia     = None  # (hi, lo) IA of current backend slot
+        self._secure_session = None  # SecureSession for encrypt/decrypt (if backend is secure)
 
         # Metrics
         self.bytes_in     = 0

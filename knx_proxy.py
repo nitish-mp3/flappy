@@ -276,6 +276,160 @@ class KNXProxy:
 
         return False, '', '', 1
 
+    def _establish_secure_session(
+        self, bsock: socket.socket, b_host: str, b_port: int,
+        device_pw: str, user_pw: str, user_id: int,
+    ) -> Optional['SecureSession']:
+        """
+        Establish a KNX IP Secure session with the backend:
+          1. Send SESSION_REQUEST (ECDH public key)
+          2. Receive SESSION_RESPONSE (server ECDH key → derive shared key)
+          3. Send SESSION_AUTHENTICATE (user password MAC)
+          4. Receive SESSION_STATUS (auth result)
+        Returns the authenticated SecureSession, or None on failure.
+        """
+        if not is_secure_available():
+            log.error("KNX IP Secure requested but cryptography library not available")
+            return None
+
+        sec = SecureSession(device_pw, user_pw, user_id)
+
+        # 1. SESSION_REQUEST
+        req_frame = sec.build_session_request()
+        try:
+            bsock.sendall(req_frame)
+        except Exception as e:
+            log.error(f"Secure handshake: failed to send SESSION_REQUEST: {e}")
+            return None
+
+        # 2. SESSION_RESPONSE
+        try:
+            bsock.settimeout(5.0)
+            svc, body = read_tcp_frame(bsock)
+        except Exception as e:
+            log.error(f"Secure handshake: failed to read SESSION_RESPONSE: {e}")
+            return None
+
+        if svc != SECURE_SESSION_RESP or body is None:
+            log.error(f"Secure handshake: expected SESSION_RESPONSE (0x0952), "
+                      f"got {svc_name(svc) if svc else 'None'}")
+            return None
+
+        if not sec.process_session_response(body):
+            log.error("Secure handshake: SESSION_RESPONSE processing failed")
+            return None
+
+        log.info(f"Secure handshake: key exchange OK, session_id={sec.session_id}")
+
+        # 3. SESSION_AUTHENTICATE
+        auth_frame = sec.build_session_authenticate()
+        try:
+            bsock.sendall(auth_frame)
+        except Exception as e:
+            log.error(f"Secure handshake: failed to send SESSION_AUTHENTICATE: {e}")
+            return None
+
+        # 4. SESSION_STATUS
+        try:
+            bsock.settimeout(5.0)
+            svc, body = read_tcp_frame(bsock)
+        except Exception as e:
+            log.error(f"Secure handshake: failed to read SESSION_STATUS: {e}")
+            return None
+
+        if svc != SECURE_SESSION_STATUS or body is None:
+            log.error(f"Secure handshake: expected SESSION_STATUS (0x0954), "
+                      f"got {svc_name(svc) if svc else 'None'}")
+            return None
+
+        if not sec.process_session_status(body):
+            log.error("Secure handshake: authentication failed — "
+                      "check device_password and user_password")
+            return None
+
+        log.info(f"Secure session established with {b_host}:{b_port} "
+                 f"(session_id={sec.session_id}, user_id={user_id})")
+        return sec
+
+    def _negotiate_tunnel_secure(
+        self, bsock: socket.socket, sec: 'SecureSession',
+        client_cri: Optional[bytes] = None,
+    ) -> Tuple[Optional[int], Optional[bytes], Optional[int]]:
+        """
+        Negotiate a KNX tunnel through a KNX IP Secure session.
+        Sends CONNECT_REQUEST wrapped in SECURE_WRAPPER, reads back the
+        SECURE_WRAPPER containing CONNECT_RESPONSE.
+        Returns (channel_id, crd, status) or (None, None, status) on failure.
+        """
+        from knx_const import CRI_TUNNEL_V1
+
+        cri = client_cri if (client_cri and len(client_cri) >= 4) else CRI_TUNNEL_V1
+        ctrl = make_hpai('0.0.0.0', 0, PROTO_TCP)
+        data = make_hpai('0.0.0.0', 0, PROTO_TCP)
+        inner_body = ctrl + data + cri
+        inner_frame = make_frame(CONNECT_REQ, inner_body)
+
+        # Wrap in SECURE_WRAPPER
+        wrapped = sec.encrypt_frame(inner_frame)
+        try:
+            bsock.sendall(wrapped)
+        except Exception as e:
+            log.error(f"Secure tunnel negotiation: failed to send CONNECT_REQ: {e}")
+            return None, None, E_DATA_CONN
+
+        # Read response — should be SECURE_WRAPPER containing CONNECT_RESP
+        try:
+            bsock.settimeout(5.0)
+            svc, body = read_tcp_frame(bsock)
+        except Exception as e:
+            log.error(f"Secure tunnel negotiation: failed to read response: {e}")
+            return None, None, E_DATA_CONN
+
+        if svc is None:
+            log.error("Secure tunnel negotiation: backend closed connection")
+            return None, None, E_DATA_CONN
+
+        # Decrypt if wrapped
+        if svc == SECURE_WRAPPER:
+            inner = sec.decrypt_frame(body)
+            if inner is None:
+                log.error("Secure tunnel negotiation: failed to decrypt response")
+                return None, None, E_DATA_CONN
+            inner_svc, inner_body = parse_frame(inner)
+            if inner_svc is None:
+                log.error("Secure tunnel negotiation: invalid inner frame")
+                return None, None, E_DATA_CONN
+            svc, body = inner_svc, inner_body
+        elif svc == CONNECT_RESP:
+            # Some gateways may reply with plain CONNECT_RESP even in secure mode
+            pass
+        else:
+            log.error(f"Secure tunnel negotiation: unexpected response "
+                      f"{svc_name(svc)} (0x{svc:04X})")
+            return None, None, E_DATA_CONN
+
+        if svc != CONNECT_RESP or not body or len(body) < 2:
+            log.error(f"Secure tunnel negotiation: expected CONNECT_RESP, "
+                      f"got {svc_name(svc) if svc else 'None'}")
+            return None, None, E_DATA_CONN
+
+        ch_id, status = body[0], body[1]
+        if status != 0x00:
+            log.warning(f"Secure tunnel negotiation: rejected status=0x{status:02x}")
+            return None, None, status
+
+        # Parse CRD
+        crd = CRD_DEFAULT
+        if len(body) >= 10:
+            _, _, _, r_off = parse_hpai(body, 2)
+            if r_off < len(body):
+                crd = body[r_off:]
+        elif len(body) > 2:
+            crd = body[2:]
+
+        log.info(f"Secure tunnel negotiation: accepted ch={ch_id} crd={crd.hex()}")
+        return ch_id, crd, 0x00
+
     def _create_session(self, client_type: str,
                         client_ctrl: Tuple[str, int],
                         client_data: Tuple[str, int],
@@ -329,56 +483,114 @@ class KNXProxy:
         _, _, _, off = parse_hpai(connect_body, off)
         client_cri = connect_body[off:] if off < len(connect_body) else None
 
-        # Negotiate tunnel
-        try:
-            ch_id, crd, status = self.connector.negotiate_tunnel(
-                bsock, b_host, b_port, b_proto, client_cri
+        # Check if backend requires KNX IP Secure
+        is_secure, device_pw, user_pw, user_id = self._get_secure_config(b_host, b_port)
+        _secure_session = None
+
+        if is_secure:
+            # ── KNX IP Secure path ──
+            # Secure always requires TCP
+            if b_proto != 'tcp':
+                try:
+                    bsock.close()
+                except Exception:
+                    pass
+                try:
+                    bsock = self.connector.open_socket(b_host, b_port, 'tcp')
+                except Exception as e:
+                    log.error(f"Cannot reach backend {b_host}:{b_port} [tcp] for secure: {e}")
+                    report_backend_reject(b_host, b_port, 'tcp', E_DATA_CONN)
+                    self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
+                    self._send_connect_error(client_type, client_ctrl, client_sock, E_DATA_CONN)
+                    return
+                b_proto = 'tcp'
+
+            # Establish secure session (ECDH + auth)
+            _secure_session = self._establish_secure_session(
+                bsock, b_host, b_port, device_pw, user_pw, user_id
             )
-        except Exception as e:
-            log.error(f"Backend tunnel negotiation error: {e}")
-            report_backend_reject(b_host, b_port, b_proto, E_DATA_CONN)
-            self._send_connect_error(client_type, client_ctrl, client_sock, E_DATA_CONN)
-            return
+            if _secure_session is None:
+                try:
+                    bsock.close()
+                except Exception:
+                    pass
+                report_backend_reject(b_host, b_port, b_proto, E_DATA_CONN)
+                self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
+                self._send_connect_error(client_type, client_ctrl, client_sock, E_DATA_CONN)
+                return
 
-        # For TCP, negotiate_tunnel opens fresh sockets per attempt.
-        # The winning socket is in connector._last_good_sock.
-        if self.connector._last_good_sock is not None:
-            bsock = self.connector._last_good_sock
+            # Negotiate tunnel inside the secure session
+            ch_id, crd, status = self._negotiate_tunnel_secure(
+                bsock, _secure_session, client_cri
+            )
+            if ch_id is None:
+                try:
+                    bsock.close()
+                except Exception:
+                    pass
+                final_status = status if status else E_DATA_CONN
+                report_backend_reject(b_host, b_port, b_proto, final_status)
+                self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
+                self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
+                return
 
-        if ch_id is None:
-            final_status = status if status else E_DATA_CONN
+        else:
+            # ── Plain tunnel negotiation path ──
+            # Negotiate tunnel
+            try:
+                ch_id, crd, status = self.connector.negotiate_tunnel(
+                    bsock, b_host, b_port, b_proto, client_cri
+                )
+            except Exception as e:
+                log.error(f"Backend tunnel negotiation error: {e}")
+                report_backend_reject(b_host, b_port, b_proto, E_DATA_CONN)
+                self._send_connect_error(client_type, client_ctrl, client_sock, E_DATA_CONN)
+                return
 
-            # Try protocol fallback if rejected with 0x22 (no free slots)
-            if final_status == 0x22:
-                if b_proto == 'udp':
-                    log.info("UDP tunnel rejected (0x22) — trying TCP fallback")
-                    fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_tcp_fallback(
-                        b_host, b_port, client_cri
-                    )
-                    if fb_sock and fb_ch is not None:
-                        bsock = fb_sock
-                        ch_id = fb_ch
-                        crd = fb_crd
-                        b_proto = 'tcp'
-                        log.info(f"TCP fallback succeeded: ch={ch_id}")
+            # For TCP, negotiate_tunnel opens fresh sockets per attempt.
+            # The winning socket is in connector._last_good_sock.
+            if self.connector._last_good_sock is not None:
+                bsock = self.connector._last_good_sock
+
+            if ch_id is None:
+                final_status = status if status else E_DATA_CONN
+
+                # Try protocol fallback if rejected with 0x22 (no free slots)
+                if final_status == 0x22:
+                    if b_proto == 'udp':
+                        log.info("UDP tunnel rejected (0x22) — trying TCP fallback")
+                        fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_tcp_fallback(
+                            b_host, b_port, client_cri
+                        )
+                        if fb_sock and fb_ch is not None:
+                            bsock = fb_sock
+                            ch_id = fb_ch
+                            crd = fb_crd
+                            b_proto = 'tcp'
+                            log.info(f"TCP fallback succeeded: ch={ch_id}")
+                        else:
+                            report_backend_reject(b_host, b_port, 'udp', final_status)
+                            self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
+                            self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
+                            return
+                    elif b_proto == 'tcp':
+                        log.info("TCP tunnel rejected (0x22) — trying UDP fallback")
+                        fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_udp_fallback(
+                            b_host, b_port, client_cri
+                        )
+                        if fb_sock and fb_ch is not None:
+                            bsock = fb_sock
+                            ch_id = fb_ch
+                            crd = fb_crd
+                            b_proto = 'udp'
+                            log.info(f"UDP fallback succeeded: ch={ch_id}")
+                        else:
+                            report_backend_reject(b_host, b_port, 'tcp', final_status)
+                            self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
+                            self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
+                            return
                     else:
-                        report_backend_reject(b_host, b_port, 'udp', final_status)
-                        self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
-                        self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
-                        return
-                elif b_proto == 'tcp':
-                    log.info("TCP tunnel rejected (0x22) — trying UDP fallback")
-                    fb_sock, fb_ch, fb_crd, fb_status = self.connector.try_udp_fallback(
-                        b_host, b_port, client_cri
-                    )
-                    if fb_sock and fb_ch is not None:
-                        bsock = fb_sock
-                        ch_id = fb_ch
-                        crd = fb_crd
-                        b_proto = 'udp'
-                        log.info(f"UDP fallback succeeded: ch={ch_id}")
-                    else:
-                        report_backend_reject(b_host, b_port, 'tcp', final_status)
+                        report_backend_reject(b_host, b_port, b_proto, final_status)
                         self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
                         self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
                         return
@@ -387,11 +599,6 @@ class KNXProxy:
                     self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
                     self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
                     return
-            else:
-                report_backend_reject(b_host, b_port, b_proto, final_status)
-                self._backend_cooldowns[cooldown_key] = time.monotonic() + self._cooldown_seconds
-                self._send_connect_error(client_type, client_ctrl, client_sock, final_status)
-                return
 
         if crd is None:
             crd = CRD_DEFAULT
@@ -427,6 +634,7 @@ class KNXProxy:
             b_proto, (b_host, b_port), bsock,
         )
         sess.crd = crd
+        sess._secure_session = _secure_session
         # Track which individual address the client was told (from CRD in CONNECT_RESP)
         # and which backend slot we're actually on.  These may diverge if mid-relay
         # SECURE avoidance swaps to a different slot after CONNECT_RESP is sent.
@@ -751,20 +959,33 @@ class KNXProxy:
             dest = sess.client_data or sess.client_ctrl
 
             if svc == SECURE_WRAPPER:
-                # Backend assigned a KNX IP Secure tunnel slot.
-                # If we're configured for non-secure, try to reconnect
-                # to a different (plain) tunnel slot automatically.
-                if not secure_warned:
-                    secure_warned = True
-                    if not PRIMARY_SECURE:
+                # ── Secure termination: decrypt and process inner frame ──
+                if sess._secure_session:
+                    inner = sess._secure_session.decrypt_frame(body)
+                    if inner is None:
+                        log.warning(f"Relay ch={sess.channel_id}: "
+                                    f"SECURE_WRAPPER decrypt failed — skipping")
+                        continue
+                    inner_svc, inner_body = parse_frame(inner)
+                    if inner_svc is None:
+                        log.warning(f"Relay ch={sess.channel_id}: "
+                                    f"invalid inner frame after decrypt — skipping")
+                        continue
+                    # Replace svc/body/data with decrypted inner content
+                    svc = inner_svc
+                    body = inner_body
+                    data = inner
+                    # Fall through to process decrypted frame below
+                else:
+                    # Non-secure configuration — avoidance / passthrough
+                    if not secure_warned:
+                        secure_warned = True
                         log.warning(
                             f"Session ch={sess.channel_id}: backend sends "
                             f"SECURE_WRAPPER but secure=false — attempting "
                             f"auto-reconnect to non-secure tunnel slot"
                         )
                         if self._secure_reconnect(sess):
-                            # Reconnected to a plain slot — resume relay
-                            # with the new backend socket.
                             continue
                         log.warning(
                             f"Session ch={sess.channel_id}: SECURE avoidance "
@@ -772,20 +993,19 @@ class KNXProxy:
                             f"Configure HA KNX for 'KNX IP Secure Tunnelling' "
                             f"or disable KNX IP Secure in ETS."
                         )
-                    else:
-                        log.info(
-                            f"Session ch={sess.channel_id}: backend sends "
-                            f"SECURE_WRAPPER — KNX IP Secure relay active"
-                        )
-                sess.send_to_client(data, udp_sock)
-                sess.telegrams_fwd += 1
+                    sess.send_to_client(data, udp_sock)
+                    sess.telegrams_fwd += 1
+                    continue
 
-            elif svc in (TUNNELLING_REQ, TUNNELLING_ACK, CONNSTATE_RESP, DISCONNECT_RESP):
+            if svc in (TUNNELLING_REQ, TUNNELLING_ACK, CONNSTATE_RESP, DISCONNECT_RESP):
                 # Immediately ACK incoming TUNNELLING_REQ from backend
                 # so it doesn't time out waiting for the full client round-trip
                 if svc == TUNNELLING_REQ:
                     ack_body = bytes([0x04, body[1], body[2], 0x00])
-                    sess.send_to_backend(make_frame(TUNNELLING_ACK, ack_body))
+                    ack_frame = make_frame(TUNNELLING_ACK, ack_body)
+                    if sess._secure_session:
+                        ack_frame = sess._secure_session.encrypt_frame(ack_frame)
+                    sess.send_to_backend(ack_frame)
 
                 # Rewrite channel_id and seq for client if needed
                 if svc in (TUNNELLING_REQ, TUNNELLING_ACK) and len(data) > 8:
@@ -830,7 +1050,10 @@ class KNXProxy:
                 sess.send_to_client(data, udp_sock)
                 # Send ack back to backend
                 ack_body = bytes([sess._backend_ch, 0x00]) + make_hpai('0.0.0.0', 0)
-                sess.send_to_backend(make_frame(DISCONNECT_RESP, ack_body))
+                ack_frame = make_frame(DISCONNECT_RESP, ack_body)
+                if sess._secure_session:
+                    ack_frame = sess._secure_session.encrypt_frame(ack_frame)
+                sess.send_to_backend(ack_frame)
                 self.sessions.remove(sess.channel_id)
                 log.info(f"Session ch={sess.channel_id} closed by backend "
                          f"(uptime={sess.uptime():.0f}s, telegrams={sess.telegrams_fwd})")
@@ -878,43 +1101,72 @@ class KNXProxy:
         try:
             old_proto = PROTO_TCP if sess.backend_type == 'tcp' else PROTO_UDP
             body = bytes([sess._backend_ch, 0x00]) + make_hpai('0.0.0.0', 0, old_proto)
-            sess.send_to_backend(make_frame(DISCONNECT_REQ, body))
+            disc_frame = make_frame(DISCONNECT_REQ, body)
+            if sess._secure_session:
+                disc_frame = sess._secure_session.encrypt_frame(disc_frame)
+            sess.send_to_backend(disc_frame)
         except Exception:
             pass
+
+        # Check if new backend requires secure
+        is_secure, device_pw, user_pw, user_id = self._get_secure_config(b_host, b_port)
+
+        if is_secure:
+            # Force TCP for secure
+            b_proto = 'tcp'
 
         # Open new backend socket
         bsock = self.connector.open_socket(b_host, b_port, b_proto)
 
-        # Negotiate tunnel
-        ch_id, crd, status = self.connector.negotiate_tunnel(
-            bsock, b_host, b_port, b_proto
-        )
+        if is_secure:
+            # Establish secure session on new backend
+            new_sec = self._establish_secure_session(
+                bsock, b_host, b_port, device_pw, user_pw, user_id
+            )
+            if new_sec is None:
+                bsock.close()
+                raise RuntimeError("Hot-swap: secure session establishment failed")
 
-        # For TCP, negotiate_tunnel opens fresh sockets per attempt.
-        if self.connector._last_good_sock is not None:
-            bsock = self.connector._last_good_sock
-
-        # Protocol fallback: if 0x22 on one protocol, try the other
-        if ch_id is None and status == 0x22:
-            alt_proto = 'udp' if b_proto == 'tcp' else 'tcp'
-            log.info(f"Hot-swap: {b_proto.upper()} tunnel rejected (0x22) "
-                     f"— trying {alt_proto.upper()} fallback")
-            if alt_proto == 'udp':
-                fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_udp_fallback(
-                    b_host, b_port)
-            else:
-                fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_tcp_fallback(
-                    b_host, b_port)
-            if fb_sock and fb_ch is not None:
-                bsock = fb_sock
-                ch_id = fb_ch
-                crd = fb_crd
-                b_proto = alt_proto
-                log.info(f"Hot-swap: {alt_proto.upper()} fallback succeeded ch={ch_id}")
-            else:
+            ch_id, crd, status = self._negotiate_tunnel_secure(bsock, new_sec)
+            if ch_id is None:
+                bsock.close()
                 raise RuntimeError(
-                    f"Backend rejected CONNECT on both protocols "
-                    f"(status=0x{(status or 0):02x})")
+                    f"Hot-swap: secure tunnel rejected (status=0x{(status or 0):02x})")
+
+            sess._secure_session = new_sec
+        else:
+            sess._secure_session = None
+
+            # Negotiate tunnel
+            ch_id, crd, status = self.connector.negotiate_tunnel(
+                bsock, b_host, b_port, b_proto
+            )
+
+            # For TCP, negotiate_tunnel opens fresh sockets per attempt.
+            if self.connector._last_good_sock is not None:
+                bsock = self.connector._last_good_sock
+
+            # Protocol fallback: if 0x22 on one protocol, try the other
+            if ch_id is None and status == 0x22:
+                alt_proto = 'udp' if b_proto == 'tcp' else 'tcp'
+                log.info(f"Hot-swap: {b_proto.upper()} tunnel rejected (0x22) "
+                         f"— trying {alt_proto.upper()} fallback")
+                if alt_proto == 'udp':
+                    fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_udp_fallback(
+                        b_host, b_port)
+                else:
+                    fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_tcp_fallback(
+                        b_host, b_port)
+                if fb_sock and fb_ch is not None:
+                    bsock = fb_sock
+                    ch_id = fb_ch
+                    crd = fb_crd
+                    b_proto = alt_proto
+                    log.info(f"Hot-swap: {alt_proto.upper()} fallback succeeded ch={ch_id}")
+                else:
+                    raise RuntimeError(
+                        f"Backend rejected CONNECT on both protocols "
+                        f"(status=0x{(status or 0):02x})")
 
         if ch_id is None:
             raise RuntimeError(f"Backend rejected CONNECT (status=0x{(status or 0):02x})")
@@ -935,7 +1187,10 @@ class KNXProxy:
         try:
             proto = PROTO_TCP if sess.backend_type == 'tcp' else PROTO_UDP
             body = bytes([sess._backend_ch, 0x00]) + make_hpai('0.0.0.0', 0, proto)
-            sess.send_to_backend(make_frame(DISCONNECT_REQ, body))
+            frame = make_frame(DISCONNECT_REQ, body)
+            if sess._secure_session:
+                frame = sess._secure_session.encrypt_frame(frame)
+            sess.send_to_backend(frame)
         except Exception:
             pass
 
@@ -1040,6 +1295,8 @@ class KNXProxy:
                         fwd[shi] = sess._backend_ia[0]
                         fwd[slo] = sess._backend_ia[1]
                     fwd = bytes(fwd)
+                if sess._secure_session:
+                    fwd = sess._secure_session.encrypt_frame(fwd)
                 sess.send_to_backend(fwd)
                 sess.telegrams_fwd += 1
 
@@ -1055,6 +1312,8 @@ class KNXProxy:
                     fwd = bytearray(fwd)
                     fwd[6] = sess._backend_ch
                     fwd = bytes(fwd)
+                if sess._secure_session:
+                    fwd = sess._secure_session.encrypt_frame(fwd)
                 if not sess.send_to_backend(fwd):
                     log.debug(f"UDP CONNSTATE fwd failed ch={ch} — responding locally")
                     resp_body = bytes([ch, 0x00])
@@ -1072,6 +1331,8 @@ class KNXProxy:
                     fwd = bytearray(fwd)
                     fwd[6] = sess._backend_ch
                     fwd = bytes(fwd)
+                if sess._secure_session:
+                    fwd = sess._secure_session.encrypt_frame(fwd)
                 sess.send_to_backend(fwd)
                 log.info(f"Session ch={ch} disconnected by UDP client "
                          f"(uptime={sess.uptime():.0f}s, telegrams={sess.telegrams_fwd})")
@@ -1291,13 +1552,17 @@ class KNXProxy:
                                           f"{sess._client_ia[0]:02X}{sess._client_ia[1]:02X}"
                                           f"→{sess._backend_ia[0]:02X}{sess._backend_ia[1]:02X}")
                             fwd_body = bytes(fwd_body)
-                        ok = sess.send_to_backend(make_frame(svc, fwd_body))
+                        fwd_frame = make_frame(svc, fwd_body)
+                        if sess._secure_session:
+                            fwd_frame = sess._secure_session.encrypt_frame(fwd_frame)
+                        ok = sess.send_to_backend(fwd_frame)
                         if svc == TUNNELLING_REQ:
                             sess.telegrams_fwd += 1
                             b_seq = fwd_body[2] if isinstance(fwd_body, (bytearray, bytes)) else body[2]
                             log.info(f"Client→Backend ch={ch}: "
                                      f"seq={body[2]}→{b_seq} len={len(body)} "
-                                     f"fwd={'OK' if ok else 'FAIL'}")
+                                     f"fwd={'OK' if ok else 'FAIL'}"
+                                     f"{' [secure]' if sess._secure_session else ''})")
                     else:
                         log.warning(f"No session for {svc_name(svc)} "
                                     f"ch={ch} from {addr[0]}:{addr[1]}")
@@ -1317,7 +1582,10 @@ class KNXProxy:
                             fwd_body = bytes(fwd_body)
                         # Try to forward to backend; if that fails,
                         # respond locally to keep the client session alive.
-                        if not sess.send_to_backend(make_frame(svc, fwd_body)):
+                        fwd_frame = make_frame(svc, fwd_body)
+                        if sess._secure_session:
+                            fwd_frame = sess._secure_session.encrypt_frame(fwd_frame)
+                        if not sess.send_to_backend(fwd_frame):
                             log.debug(f"CONNSTATE fwd failed ch={ch} — responding locally")
                             resp_body = bytes([ch, 0x00])
                             try:
@@ -1341,7 +1609,10 @@ class KNXProxy:
                             fwd_body = bytearray(body)
                             fwd_body[0] = sess._backend_ch
                             fwd_body = bytes(fwd_body)
-                        sess.send_to_backend(make_frame(svc, fwd_body))
+                        fwd_frame = make_frame(svc, fwd_body)
+                        if sess._secure_session:
+                            fwd_frame = sess._secure_session.encrypt_frame(fwd_frame)
+                        sess.send_to_backend(fwd_frame)
                         log.info(f"Session ch={ch} disconnected by TCP client "
                                  f"(uptime={sess.uptime():.0f}s, telegrams={sess.telegrams_fwd})")
                         sess.close()
@@ -1403,6 +1674,8 @@ class KNXProxy:
                 b_proto = PROTO_TCP if sess.backend_type == 'tcp' else PROTO_UDP
                 hb_body = bytes([sess._backend_ch, 0x00]) + make_hpai('0.0.0.0', 0, b_proto)
                 hb_frame = make_frame(CONNSTATE_REQ, hb_body)
+                if sess._secure_session:
+                    hb_frame = sess._secure_session.encrypt_frame(hb_frame)
                 if not sess.send_to_backend(hb_frame):
                     log.warning(f"Backend heartbeat failed ch={sess._backend_ch}")
                 else:
