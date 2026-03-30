@@ -65,8 +65,10 @@ PRIMARY_SECURE      = os.environ.get('PRIMARY_SECURE', 'false').lower() == 'true
 BACKUP_SECURE       = os.environ.get('BACKUP_SECURE', 'false').lower() == 'true'
 PRIMARY_DEVICE_PW   = os.environ.get('PRIMARY_DEVICE_PASSWORD', '')
 PRIMARY_USER_PW     = os.environ.get('PRIMARY_USER_PASSWORD', '')
+PRIMARY_USER_ID     = int(os.environ.get('PRIMARY_USER_ID', '1'))
 BACKUP_DEVICE_PW    = os.environ.get('BACKUP_DEVICE_PASSWORD', '')
 BACKUP_USER_PW      = os.environ.get('BACKUP_USER_PASSWORD', '')
+BACKUP_USER_ID      = int(os.environ.get('BACKUP_USER_ID', '1'))
 
 # ── Logging ───────────────────────────────────────────────────────────
 _lvl = os.environ.get('LOG_LEVEL', 'info').upper()
@@ -257,22 +259,22 @@ class KNXProxy:
     # Backend connection
     # ──────────────────────────────────────────────────────────────────
 
-    def _get_secure_config(self, host: str, port: int) -> Tuple[bool, str, str]:
+    def _get_secure_config(self, host: str, port: int) -> Tuple[bool, str, str, int]:
         """Determine if a backend should use secure mode."""
         backend = read_backend()
         if backend is None:
-            return False, '', ''
+            return False, '', '', 1
 
         b_host, b_port, _ = backend
 
         # Check primary
         if PRIMARY_SECURE and b_host == host:
-            return True, PRIMARY_DEVICE_PW, PRIMARY_USER_PW
+            return True, PRIMARY_DEVICE_PW, PRIMARY_USER_PW, PRIMARY_USER_ID
         # Check backup
         if BACKUP_SECURE and b_host == host:
-            return True, BACKUP_DEVICE_PW, BACKUP_USER_PW
+            return True, BACKUP_DEVICE_PW, BACKUP_USER_PW, BACKUP_USER_ID
 
-        return False, '', ''
+        return False, '', '', 1
 
     def _create_session(self, client_type: str,
                         client_ctrl: Tuple[str, int],

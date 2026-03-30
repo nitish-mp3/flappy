@@ -18,6 +18,8 @@ import sys
 import logging
 import threading
 import time
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 
 log = logging.getLogger('knx_webui')
@@ -27,7 +29,7 @@ STATE_FILE = "/run/knx-failover.state"
 METRICS_FILE = "/run/knx-metrics.json"
 BACKEND_FILE = "/run/knx-active-backend"
 WWW_DIR = "/www"
-VERSION = "4.3.6"
+VERSION = "4.3.7"
 
 SUPERVISOR_TOKEN = os.environ.get('SUPERVISOR_TOKEN', '')
 
@@ -170,9 +172,9 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
 
             # Persist via HA Supervisor API so changes survive restart
             persisted = False
+            persist_error = ''
             if SUPERVISOR_TOKEN:
                 try:
-                    import urllib.request
                     req = urllib.request.Request(
                         'http://supervisor/addons/self/options',
                         method='POST',
@@ -182,15 +184,28 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                             'Content-Type': 'application/json',
                         },
                     )
-                    urllib.request.urlopen(req, timeout=10)
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    resp_body = resp.read().decode('utf-8', errors='replace')
+                    log.info(f"Supervisor options saved (HTTP {resp.status}): {resp_body[:200]}")
                     persisted = True
+                except urllib.error.HTTPError as he:
+                    err_body = he.read().decode('utf-8', errors='replace')[:300]
+                    persist_error = f"HTTP {he.code}: {err_body}"
+                    log.warning(f"Supervisor options save failed: {persist_error}")
                 except Exception as e:
+                    persist_error = str(e)
                     log.warning(f"Supervisor options save failed: {e}")
+            else:
+                persist_error = 'No SUPERVISOR_TOKEN available'
+                log.warning("Cannot persist options — no SUPERVISOR_TOKEN")
 
-            msg = 'Configuration saved'
-            if not persisted:
-                msg += ' (runtime only — restart may revert changes)'
-            self._json({'ok': True, 'message': msg, 'persisted': persisted})
+            self._json({
+                'ok': True,
+                'persisted': persisted,
+                'persist_error': persist_error,
+                'needs_restart': True,
+                'message': 'Configuration saved. Restart the add-on for changes to take effect.',
+            })
         except json.JSONDecodeError:
             self._json({'error': 'Invalid JSON'}, 400)
         except Exception as e:
@@ -384,7 +399,6 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             self._json({'error': 'Supervisor token not available'}, 503)
             return
         try:
-            import urllib.request
             req = urllib.request.Request(
                 'http://supervisor/addons/self/restart',
                 method='POST',

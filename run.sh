@@ -22,7 +22,7 @@ readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly WEBUI_PID_FILE="/run/knx-webui.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="4.3.6"
+readonly VERSION="4.3.7"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"
@@ -34,8 +34,8 @@ readonly STATE_KNXD="KNXD"
 # -- Config vars ---
 PRIMARY_HOST="" PRIMARY_PORT="" PRIMARY_PROTOCOL="" PRIMARY_SECURE=""
 BACKUP_HOST="" BACKUP_PORT="" BACKUP_PROTOCOL="" BACKUP_SECURE=""
-PRIMARY_DEVICE_PW="" PRIMARY_USER_PW=""
-BACKUP_DEVICE_PW="" BACKUP_USER_PW=""
+PRIMARY_DEVICE_PW="" PRIMARY_USER_PW="" PRIMARY_USER_ID=""
+BACKUP_DEVICE_PW="" BACKUP_USER_PW="" BACKUP_USER_ID=""
 FRONTEND_PROTOCOL="" LISTEN_PORT=""
 USB_DEVICE="" USB_BAUD="" USB_PRIORITY="" USB_MODE="" USB_KNXD_EXTRA=""
 KNXD_HOST="" KNXD_PORT="" KNXD_PROTOCOL=""
@@ -54,6 +54,9 @@ PRIMARY_FAIL_COUNT=0
 PRIMARY_RISE_COUNT=0
 BACKUP_FAIL_COUNT=0
 PRIMARY_HOLD_UNTIL=0
+FAILBACK_ATTEMPT_COUNT=0
+FAILBACK_ATTEMPT_MAX=3
+PRIMARY_ENTERED_TS=0
 HAS_KNXD=false
 HAS_PYUSB=false
 USB_LOCAL_PORT=13671
@@ -108,6 +111,7 @@ load_config() {
     PRIMARY_SECURE="$(read_option primary_secure false)"
     PRIMARY_DEVICE_PW="$(read_option primary_device_password '')"
     PRIMARY_USER_PW="$(read_option primary_user_password '')"
+    PRIMARY_USER_ID="$(read_option primary_user_id 1)"
 
     # Backup
     BACKUP_HOST="$(read_option backup_host '')"
@@ -116,6 +120,7 @@ load_config() {
     BACKUP_SECURE="$(read_option backup_secure false)"
     BACKUP_DEVICE_PW="$(read_option backup_device_password '')"
     BACKUP_USER_PW="$(read_option backup_user_password '')"
+    BACKUP_USER_ID="$(read_option backup_user_id 1)"
 
     # Frontend
     FRONTEND_PROTOCOL="$(read_option frontend_protocol udp)"
@@ -327,8 +332,10 @@ start_proxy() {
     BACKUP_SECURE="$BACKUP_SECURE" \
     PRIMARY_DEVICE_PASSWORD="$PRIMARY_DEVICE_PW" \
     PRIMARY_USER_PASSWORD="$PRIMARY_USER_PW" \
+    PRIMARY_USER_ID="$PRIMARY_USER_ID" \
     BACKUP_DEVICE_PASSWORD="$BACKUP_DEVICE_PW" \
     BACKUP_USER_PASSWORD="$BACKUP_USER_PW" \
+    BACKUP_USER_ID="$BACKUP_USER_ID" \
     python3 /knx_proxy.py "$LISTEN_PORT" &
 
     PROXY_PID="$!"
@@ -559,6 +566,7 @@ enter_primary() {
     CURRENT_STATE="$STATE_PRIMARY"
     PRIMARY_FAIL_COUNT=0; PRIMARY_RISE_COUNT=0; BACKUP_FAIL_COUNT=0
     PRIMARY_HOLD_UNTIL=0
+    PRIMARY_ENTERED_TS="$(date +%s)"
     stop_usb_bridge
     set_backend "$PRIMARY_HOST" "$PRIMARY_PORT" "$proto"
     reload_proxy
@@ -749,7 +757,17 @@ tick_primary() {
             fi
             return 0
         fi
-        log_debug "Primary: OK [${proto}]"; PRIMARY_FAIL_COUNT=0; return 0
+        log_debug "Primary: OK [${proto}]"; PRIMARY_FAIL_COUNT=0
+        # If primary has been stable long enough, reset failback attempt counter
+        if [[ "$FAILBACK_ATTEMPT_COUNT" -gt 0 ]] && [[ "$PRIMARY_ENTERED_TS" -gt 0 ]]; then
+            local now_ts; now_ts="$(date +%s)"
+            local stable_secs=$(( now_ts - PRIMARY_ENTERED_TS ))
+            if [[ "$stable_secs" -ge "$FAILBACK_DELAY" ]]; then
+                log_info "Primary stable for ${stable_secs}s — resetting failback attempt counter (was ${FAILBACK_ATTEMPT_COUNT})"
+                FAILBACK_ATTEMPT_COUNT=0
+            fi
+        fi
+        return 0
     fi
 
     PRIMARY_FAIL_COUNT=$((PRIMARY_FAIL_COUNT + 1))
@@ -827,7 +845,17 @@ tick_backup() {
                 PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
                 log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
                 if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
-                    log_notice "Primary recovered — failing back"
+                    # Check if we've already failed back too many times
+                    if [[ "$FAILBACK_ATTEMPT_COUNT" -ge "$FAILBACK_ATTEMPT_MAX" ]]; then
+                        log_warn "Primary failback failed ${FAILBACK_ATTEMPT_COUNT} times — switching to manual (sticky) mode"
+                        FAILBACK_MODE="manual"
+                        PRIMARY_RISE_COUNT=0
+                        write_state
+                        ha_notify "Failback sticky" "Primary failback failed ${FAILBACK_ATTEMPT_COUNT} times. Staying on backup. Restart add-on to retry."
+                        return 0
+                    fi
+                    FAILBACK_ATTEMPT_COUNT=$((FAILBACK_ATTEMPT_COUNT + 1))
+                    log_notice "Primary recovered — failing back (attempt ${FAILBACK_ATTEMPT_COUNT}/${FAILBACK_ATTEMPT_MAX})"
                     enter_primary "$proto"
                 fi
             else
@@ -841,13 +869,20 @@ tick_backup() {
 
 tick_usb() {
     # Try to recover to IP interfaces
-    if [[ "$USB_PRIORITY" != "prefer" ]]; then
+    if [[ "$USB_PRIORITY" != "prefer" ]] && [[ "$FAILBACK_MODE" == "auto" ]]; then
         if [[ -n "$PRIMARY_HOST" ]]; then
             local proto
             proto="$(detect_protocol "$PRIMARY_HOST" "$PRIMARY_PORT" "$PRIMARY_PROTOCOL")"
             if [[ "$proto" != "none" ]]; then
-                proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
-                log_notice "Primary recovered (from USB)"; enter_primary "$proto"; return 0; fi
+                if [[ "$FAILBACK_ATTEMPT_COUNT" -ge "$FAILBACK_ATTEMPT_MAX" ]]; then
+                    log_debug "Primary reachable from USB but failback sticky (${FAILBACK_ATTEMPT_COUNT} failures)"
+                else
+                    proto="$(select_backend_proto "$proto" "$PRIMARY_PROTOCOL")"
+                    FAILBACK_ATTEMPT_COUNT=$((FAILBACK_ATTEMPT_COUNT + 1))
+                    log_notice "Primary recovered (from USB, attempt ${FAILBACK_ATTEMPT_COUNT}/${FAILBACK_ATTEMPT_MAX})"
+                    enter_primary "$proto"; return 0
+                fi
+            fi
         fi
 
         if [[ -n "$BACKUP_HOST" ]]; then
@@ -976,7 +1011,16 @@ tick_knxd() {
                     PRIMARY_RISE_COUNT=$((PRIMARY_RISE_COUNT + 1))
                     log_info "Primary recovery probe OK (${PRIMARY_RISE_COUNT}/${CHECK_RISE})"
                     if [[ "$PRIMARY_RISE_COUNT" -ge "$CHECK_RISE" ]]; then
-                        log_notice "Primary recovered — failing back from knxd"
+                        if [[ "$FAILBACK_ATTEMPT_COUNT" -ge "$FAILBACK_ATTEMPT_MAX" ]]; then
+                            log_warn "Primary failback failed ${FAILBACK_ATTEMPT_COUNT} times — switching to manual (sticky) mode"
+                            FAILBACK_MODE="manual"
+                            PRIMARY_RISE_COUNT=0
+                            write_state
+                            ha_notify "Failback sticky" "Primary failback failed ${FAILBACK_ATTEMPT_COUNT} times. Staying on knxd. Restart add-on to retry."
+                            return 0
+                        fi
+                        FAILBACK_ATTEMPT_COUNT=$((FAILBACK_ATTEMPT_COUNT + 1))
+                        log_notice "Primary recovered — failing back from knxd (attempt ${FAILBACK_ATTEMPT_COUNT}/${FAILBACK_ATTEMPT_MAX})"
                         enter_primary "$proto"
                     fi
                     return 0

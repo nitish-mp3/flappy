@@ -69,12 +69,14 @@ class SecureSession:
     5. Encrypt/decrypt tunnel frames
     """
 
-    def __init__(self, device_password: str = "", user_password: str = ""):
+    def __init__(self, device_password: str = "", user_password: str = "",
+                 user_id: int = 1):
         if not _SECURE_AVAILABLE:
             raise RuntimeError("Cryptography library not installed")
 
         self.device_password = device_password.encode('utf-8') if device_password else b''
         self.user_password = user_password.encode('utf-8') if user_password else b''
+        self.user_id = user_id
 
         # ECDH keypair
         self._private_key = X25519PrivateKey.generate()
@@ -166,8 +168,8 @@ class SecureSession:
 
         from knx_const import make_frame
 
-        # user_id = 0x01 for management, 0x02+ for tunnelling
-        user_id = 0x01
+        # user_id 0 = management (device auth), 1+ = tunnelling users
+        user_id = self.user_id
 
         # Authenticate using user password (not device password)
         if self.user_password:
@@ -343,7 +345,8 @@ class SecureSessionManager:
 
     def create_session(self, host: str, port: int,
                        device_password: str = "",
-                       user_password: str = "") -> Optional[SecureSession]:
+                       user_password: str = "",
+                       user_id: int = 1) -> Optional[SecureSession]:
         """Create a new secure session for a backend."""
         if not _SECURE_AVAILABLE:
             log.error("Cannot create secure session — cryptography not available")
@@ -354,7 +357,7 @@ class SecureSessionManager:
         if old:
             old.close()
 
-        session = SecureSession(device_password, user_password)
+        session = SecureSession(device_password, user_password, user_id)
         self._sessions[key] = session
         log.info(f"Created secure session for {host}:{port}")
         return session
