@@ -35,3 +35,4 @@ docker-compose.override.yml
 *.tmp
 *.log
 *.pid
+/graphify-out

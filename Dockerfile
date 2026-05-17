@@ -1,5 +1,5 @@
 ARG BUILD_FROM
-FROM $BUILD_FROM
+FROM  ${BUILD_FROM}
 
 # ── Runtime dependencies ──────────────────────────────────────────────
 # socat       – fallback USB serial bridge (serial-only, e.g. /dev/ttyUSB*)
