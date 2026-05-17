@@ -1,5 +1,11 @@
-ARG BUILD_FROM
-FROM  ${BUILD_FROM}
+FROM ghcr.io/home-assistant/base:latest
+
+ARG BUILD_VERSION
+ARG BUILD_ARCH
+LABEL \
+    io.hass.version="${BUILD_VERSION}" \
+    io.hass.type="app" \
+    io.hass.arch="${BUILD_ARCH}"
 
 # ── Runtime dependencies ──────────────────────────────────────────────
 # socat       – fallback USB serial bridge (serial-only, e.g. /dev/ttyUSB*)
