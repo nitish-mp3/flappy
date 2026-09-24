@@ -29,7 +29,9 @@ STATE_FILE = "/run/knx-failover.state"
 METRICS_FILE = "/run/knx-metrics.json"
 BACKEND_FILE = "/run/knx-active-backend"
 WWW_DIR = "/www"
-VERSION = "4.3.11"
+VERSION = "4.4.0"
+DISCOVERY_LOCK = threading.Lock()
+RESTART_LOCK = threading.Lock()
 
 SUPERVISOR_TOKEN = os.environ.get('SUPERVISOR_TOKEN', '')
 
@@ -37,10 +39,17 @@ SUPERVISOR_TOKEN = os.environ.get('SUPERVISOR_TOKEN', '')
 class APIHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for the KNX web UI."""
 
-    server_version = "KNXProxy/4.1.3"
+    server_version = "KNXProxy/4.4.0"
 
     def log_message(self, fmt, *args):
         log.debug(fmt % args)
+
+    def _authorized(self):
+        # Ingress authenticates users. Trust the socket peer, never forwarded headers.
+        if self.client_address[0] not in ('172.30.32.2', '127.0.0.1', '::1'):
+            self._json({'error': 'Open Flappy through Home Assistant ingress'}, 403)
+            return False
+        return True
 
     # ── Response helpers ──────────────────────────────────────────────
 
@@ -71,11 +80,16 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get('Content-Length', 0))
+        if not 0 <= length <= 131072:
+            raise ValueError('Request too large')
+        self.connection.settimeout(10)
         return self.rfile.read(length) if length > 0 else b''
 
     # ── Routing ───────────────────────────────────────────────────────
 
     def do_GET(self):
+        if not self._authorized():
+            return
         path = urlparse(self.path).path.rstrip('/')
         if path in ('', '/'):
             self._serve_file(os.path.join(WWW_DIR, 'index.html'),
@@ -92,12 +106,15 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             self._api_usb_discover()
         elif path == '/api/interfaces':
             self._api_interfaces()
+        elif path == '/api/events':
+            from knx_events import recent
+            self._json({'events': recent()})
         elif path == '/api/version':
             self._json({'version': VERSION})
         else:
             safe = path.lstrip('/')
             fp = os.path.realpath(os.path.join(WWW_DIR, safe))
-            if fp.startswith(os.path.realpath(WWW_DIR)) and os.path.isfile(fp):
+            if os.path.commonpath([fp, os.path.realpath(WWW_DIR)]) == os.path.realpath(WWW_DIR) and os.path.isfile(fp):
                 ext = os.path.splitext(fp)[1].lower()
                 mime = {'.css': 'text/css', '.js': 'application/javascript',
                         '.svg': 'image/svg+xml', '.png': 'image/png',
@@ -108,10 +125,20 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(404)
 
     def do_POST(self):
+        if not self._authorized():
+            return
         path = urlparse(self.path).path.rstrip('/')
-        body = self._read_body()
+        try:
+            body = self._read_body()
+        except (ValueError, socket.timeout):
+            self._json({'error': 'Invalid or oversized request (limit 128 KiB)'}, 400)
+            return
         if path == '/api/config':
             self._api_set_config(body)
+        elif path == '/api/discover':
+            self._api_discover(body)
+        elif path == '/api/select':
+            self._api_select(body)
         elif path == '/api/reload':
             self._api_reload()
         elif path == '/api/restart':
@@ -146,70 +173,38 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
         })
 
     def _api_get_config(self):
-        try:
-            with open(OPTIONS_FILE, 'r', encoding='utf-8') as f:
-                self._json(json.load(f))
-        except Exception as e:
-            self._json({'error': str(e)}, 500)
+        from knx_config import load_config
+        cfg = load_config()
+        for key in list(cfg):
+            if 'password' in key:
+                del cfg[key]
+        for item in cfg['interfaces']:
+            for key in ('device_password', 'user_password'):
+                item[key + '_set'] = bool(item.pop(key, ''))
+        self._json(cfg)
 
-    def _api_set_config(self, body: bytes):
+    def _api_set_config(self, body):
+        from knx_config import save_config, load_config
         try:
             updates = json.loads(body)
             if not isinstance(updates, dict):
-                self._json({'error': 'Expected JSON object'}, 400)
-                return
-
-            # Read current options
-            with open(OPTIONS_FILE, 'r', encoding='utf-8') as f:
-                current = json.load(f)
-            current.update(updates)
-
-            # Write locally for immediate effect (current run)
-            tmp = OPTIONS_FILE + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(current, f, indent=2)
-            os.replace(tmp, OPTIONS_FILE)
-
-            # Persist via HA Supervisor API so changes survive restart
-            persisted = False
-            persist_error = ''
-            if SUPERVISOR_TOKEN:
-                try:
-                    req = urllib.request.Request(
-                        'http://supervisor/addons/self/options',
-                        method='POST',
-                        data=json.dumps({'options': current}).encode(),
-                        headers={
-                            'Authorization': f'Bearer {SUPERVISOR_TOKEN}',
-                            'Content-Type': 'application/json',
-                        },
-                    )
-                    resp = urllib.request.urlopen(req, timeout=10)
-                    resp_body = resp.read().decode('utf-8', errors='replace')
-                    log.info(f"Supervisor options saved (HTTP {resp.status}): {resp_body[:200]}")
-                    persisted = True
-                except urllib.error.HTTPError as he:
-                    err_body = he.read().decode('utf-8', errors='replace')[:300]
-                    persist_error = f"HTTP {he.code}: {err_body}"
-                    log.warning(f"Supervisor options save failed: {persist_error}")
-                except Exception as e:
-                    persist_error = str(e)
-                    log.warning(f"Supervisor options save failed: {e}")
-            else:
-                persist_error = 'No SUPERVISOR_TOKEN available'
-                log.warning("Cannot persist options — no SUPERVISOR_TOKEN")
-
-            self._json({
-                'ok': True,
-                'persisted': persisted,
-                'persist_error': persist_error,
-                'needs_restart': True,
-                'message': 'Configuration saved. Restart the add-on for changes to take effect.',
-            })
-        except json.JSONDecodeError:
-            self._json({'error': 'Invalid JSON'}, 400)
-        except Exception as e:
-            self._json({'error': str(e)}, 500)
+                raise ValueError('Expected a JSON object')
+            old = {i['id']: i for i in load_config()['interfaces']}
+            for item in updates.get('interfaces', []):
+                for key in ('device_password', 'user_password'):
+                    if key not in item and item.get('id') in old:
+                        item[key] = old[item['id']].get(key, '')
+                    item.pop(key + '_set', None)
+            cfg = save_config(updates)
+            self._json(dict(ok=True, persisted=True, revision=cfg['revision'],
+                            needs_restart=True, message='Saved. Restart to apply.'))
+        except RuntimeError as exc:
+            self._json({'error': str(exc)}, 409)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            self._json({'error': str(exc)}, 400)
+        except OSError:
+            log.exception('Configuration save failed')
+            self._json({'error': 'Could not persist configuration; previous configuration retained'}, 500)
 
     def _api_sessions(self):
         metrics = _read_metrics_file()
@@ -239,141 +234,50 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             self._json({'devices': [], 'count': 0, 'error': str(e)})
 
     def _api_interfaces(self):
-        """Return status of all configured interfaces (primary, backup, knxd, USB)."""
+        from knx_config import load_config, CONFIG_FILE
         try:
-            cfg = {}
+            with open('/run/flappy-interfaces.json', encoding='utf-8') as f:
+                data = json.load(f)
+            data['stale'] = time.time() - data.get('timestamp', 0) > 15
+        except (OSError, ValueError):
+            data = {'interfaces': [], 'revision': None, 'stale': True}
+        cfg = load_config()
+        data['saved_revision'] = cfg['revision']
+        data['legacy_mode'] = not os.path.exists(CONFIG_FILE) and data['revision'] is None
+        data['needs_restart'] = os.path.exists(CONFIG_FILE) and data['revision'] != cfg['revision']
+        self._json(data)
+
+    def _api_discover(self, body):
+        from knx_discovery import discover
+        try:
+            params = json.loads(body or b'{}')
+            local_ip = params.get('local_ip', '0.0.0.0')
+            socket.inet_aton(local_ip)
+            if not DISCOVERY_LOCK.acquire(blocking=False):
+                self._json({'error': 'A scan is already running'}, 409)
+                return
             try:
-                with open(OPTIONS_FILE, 'r', encoding='utf-8') as f:
-                    cfg = json.load(f)
-            except Exception:
-                pass
+                self._json({'devices': discover(local_ip=local_ip)})
+            finally:
+                DISCOVERY_LOCK.release()
+        except (ValueError, OSError, AttributeError) as exc:
+            self._json({'error': str(exc)}, 400)
 
-            state = _read_state_file()
-            backend = _read_backend_file()
-            current_state = state.get('state', 'UNKNOWN')
-
-            interfaces = []
-
-            # Primary
-            ph = cfg.get('primary_host', '')
-            if ph:
-                active = (current_state == 'PRIMARY' and backend
-                          and backend.get('host') == ph)
-                interfaces.append({
-                    'name': 'Primary',
-                    'type': 'network',
-                    'host': ph,
-                    'port': cfg.get('primary_port', 3671),
-                    'protocol': cfg.get('primary_protocol', 'tcp'),
-                    'secure': cfg.get('primary_secure', False),
-                    'active': active,
-                    'status': 'active' if active else 'standby',
-                })
-            else:
-                interfaces.append({
-                    'name': 'Primary',
-                    'type': 'network',
-                    'host': '',
-                    'port': 3671,
-                    'protocol': '-',
-                    'secure': False,
-                    'active': False,
-                    'status': 'not_configured',
-                })
-
-            # Backup
-            bh = cfg.get('backup_host', '')
-            if bh:
-                active = (current_state == 'BACKUP' and backend
-                          and backend.get('host') == bh)
-                interfaces.append({
-                    'name': 'Backup',
-                    'type': 'network',
-                    'host': bh,
-                    'port': cfg.get('backup_port', 3671),
-                    'protocol': cfg.get('backup_protocol', 'udp'),
-                    'secure': cfg.get('backup_secure', False),
-                    'active': active,
-                    'status': 'active' if active else 'standby',
-                })
-            else:
-                interfaces.append({
-                    'name': 'Backup',
-                    'type': 'network',
-                    'host': '',
-                    'port': 3671,
-                    'protocol': '-',
-                    'secure': False,
-                    'active': False,
-                    'status': 'not_configured',
-                })
-
-            # knxd
-            kh = cfg.get('knxd_host', '')
-            if kh:
-                active = (current_state == 'KNXD' and backend
-                          and backend.get('host') == kh)
-                interfaces.append({
-                    'name': 'knxd',
-                    'type': 'network',
-                    'host': kh,
-                    'port': cfg.get('knxd_port', 3671),
-                    'protocol': cfg.get('knxd_protocol', 'udp'),
-                    'secure': False,
-                    'active': active,
-                    'status': 'active' if active else 'standby',
-                })
-
-            # USB
-            ud = cfg.get('usb_device', '')
-            usb_active = current_state == 'USB'
-            usb_mode = cfg.get('usb_mode', 'auto')
-            usb_status = 'not_configured'
-            usb_error = ''
-            if ud:
-                usb_status = 'active' if usb_active else 'standby'
-                # Check device existence
-                if not os.path.exists(ud):
-                    usb_status = 'device_missing'
-                    usb_error = f'Device {ud} not found'
-                else:
-                    is_raw = ud.startswith('/dev/bus/usb/') or ud.startswith('/dev/hidraw')
-                    # Check if bridge tools are available
-                    has_knxd = os.path.isfile('/usr/bin/knxd') or os.path.isfile('/usr/local/bin/knxd')
-                    has_pyusb = False
-                    try:
-                        import importlib
-                        importlib.import_module('usb.core')
-                        has_pyusb = True
-                    except Exception:
-                        pass
-                    if is_raw and not has_knxd and not has_pyusb:
-                        usb_status = 'no_driver'
-                        usb_error = ('Raw USB HID device requires knxd or pyusb. '
-                                     'Neither is installed. Rebuild the add-on.')
-                    elif usb_mode == 'socat' and is_raw:
-                        usb_status = 'incompatible'
-                        usb_error = 'socat cannot handle raw USB devices. Use native or knxd mode.'
-
-            interfaces.append({
-                'name': 'USB',
-                'type': 'usb',
-                'device': ud,
-                'mode': usb_mode,
-                'baud': cfg.get('usb_baud', 19200),
-                'priority': cfg.get('usb_priority', 'last_resort'),
-                'active': usb_active,
-                'status': usb_status,
-                'error': usb_error,
-            })
-
-            self._json({
-                'interfaces': interfaces,
-                'current_state': current_state,
-                'active_backend': backend,
-            })
-        except Exception as e:
-            self._json({'error': str(e)}, 500)
+    def _api_select(self, body):
+        from knx_config import atomic_write
+        try:
+            ident = json.loads(body)['id']
+            with open('/run/flappy-interfaces.json', encoding='utf-8') as f:
+                runtime = json.load(f)
+            if time.time() - runtime['timestamp'] > 15:
+                raise ValueError('Runtime status is stale')
+            if not any(i['id'] == ident and i['role'] == 'fallback' and i['healthy']
+                       for i in runtime['interfaces']):
+                raise ValueError('Select a healthy fallback interface')
+            atomic_write('/run/flappy-select.json', json.dumps({'id': ident, 'timestamp': time.time()}))
+            self._json({'ok': True, 'message': 'Switch requested'})
+        except (ValueError, KeyError, OSError, TypeError) as exc:
+            self._json({'error': str(exc)}, 400)
 
     def _api_reload(self):
         """Send SIGHUP to run.sh to trigger backend re-evaluation."""
@@ -398,18 +302,31 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
         if not SUPERVISOR_TOKEN:
             self._json({'error': 'Supervisor token not available'}, 503)
             return
+        if not RESTART_LOCK.acquire(blocking=False):
+            self._json({'ok': True, 'message': 'Add-on restart is already in progress'})
+            return
+
+        def restart_after_response():
+            try:
+                # Let the HTTP response reach ingress before Supervisor stops us.
+                threading.Event().wait(0.2)
+                req = urllib.request.Request(
+                    'http://supervisor/addons/self/restart', method='POST',
+                    headers={'Authorization': f'Bearer {SUPERVISOR_TOKEN}',
+                             'Content-Type': 'application/json'},
+                )
+                with urllib.request.urlopen(req, timeout=10):
+                    pass
+            except Exception:
+                log.warning('Supervisor did not confirm the restart request')
+            finally:
+                RESTART_LOCK.release()
+
         try:
-            req = urllib.request.Request(
-                'http://supervisor/addons/self/restart',
-                method='POST',
-                headers={
-                    'Authorization': f'Bearer {SUPERVISOR_TOKEN}',
-                    'Content-Type': 'application/json',
-                },
-            )
-            urllib.request.urlopen(req, timeout=10)
-            self._json({'ok': True, 'message': 'Add-on restart initiated'})
+            threading.Thread(target=restart_after_response, daemon=True).start()
+            self._json({'ok': True, 'message': 'Add-on restart requested'})
         except Exception as e:
+            RESTART_LOCK.release()
             self._json({'error': str(e)}, 500)
 
     def _api_health_probe(self, body: bytes):
@@ -440,7 +357,7 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             )
             proto = result.stdout.strip()
             self._json({'host': host, 'port': port,
-                         'reachable': proto != 'none', 'protocol': proto})
+                         'reachable': result.returncode == 0 and proto in ('tcp', 'udp'), 'protocol': proto if proto in ('tcp', 'udp') else 'none'})
         except Exception as e:
             self._json({'error': str(e)}, 500)
 
@@ -492,7 +409,18 @@ class ThreadedHTTPServer(http.server.HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(24)
+        super().__init__(*args, **kwargs)
+
     def process_request(self, request, client_address):
+        request.settimeout(10)
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+            finally:
+                self.shutdown_request(request)
+            return
         t = threading.Thread(target=self._handle, args=(request, client_address))
         t.daemon = True
         t.start()
@@ -504,6 +432,7 @@ class ThreadedHTTPServer(http.server.HTTPServer):
             self.handle_error(request, client_address)
         finally:
             self.shutdown_request(request)
+            self._slots.release()
 
 
 # ── Main ──────────────────────────────────────────────────────────────

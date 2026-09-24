@@ -10,7 +10,7 @@ import struct
 from typing import Optional, Tuple
 
 # ── Version ───────────────────────────────────────────────────────────
-VERSION = "4.3.11"
+VERSION = "4.4.0"
 
 # ── File Paths ────────────────────────────────────────────────────────
 BACKEND_FILE        = "/run/knx-active-backend"
@@ -162,7 +162,9 @@ def recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
         try:
             chunk = sock.recv(n - len(buf))
         except socket.timeout:
-            raise  # Caller must handle — partial read would desync stream
+            if buf:
+                raise ConnectionError("Timeout in a partial KNX frame")
+            raise
         except Exception:
             return None
         if not chunk:
@@ -180,7 +182,10 @@ def read_tcp_frame(sock: socket.socket) -> Tuple[Optional[int], Optional[bytes]]
     total = struct.unpack('>H', hdr[4:6])[0]
     if total < HEADER_SIZE:
         return None, None
-    body = recv_exact(sock, total - HEADER_SIZE)
+    try:
+        body = recv_exact(sock, total - HEADER_SIZE)
+    except socket.timeout as exc:
+        raise ConnectionError('Timeout after KNX frame header') from exc
     if body is None:
         return None, None
     return svc, body
@@ -210,4 +215,14 @@ def valid_desc_response(data: bytes) -> bool:
         return False
     if total < HEADER_SIZE or len(data) < total:
         return False
-    return True
+    offset, found = HEADER_SIZE, False
+    while offset < total:
+        if offset + 2 > total:
+            return False
+        length = data[offset]
+        if length < 2 or offset + length > total:
+            return False
+        if data[offset + 1] in (1, 2):
+            found = True
+        offset += length
+    return found

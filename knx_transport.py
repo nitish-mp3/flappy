@@ -159,6 +159,15 @@ class BackendConnector:
 
     def __init__(self, connect_timeout: float = 5.0):
         self.connect_timeout = connect_timeout
+        self._thread_state = threading.local()
+
+    @property
+    def _last_good_sock(self):
+        return getattr(self._thread_state, 'socket', None)
+
+    @_last_good_sock.setter
+    def _last_good_sock(self, value):
+        self._thread_state.socket = value
 
     def open_socket(self, host: str, port: int, proto: str) -> socket.socket:
         """
@@ -170,13 +179,21 @@ class BackendConnector:
         if proto == 'tcp':
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(self.connect_timeout)
-            s.connect((host, port))
+            try:
+                s.connect((host, port))
+            except Exception:
+                s.close()
+                raise
             return s
         else:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(self.connect_timeout)
             s.bind(('0.0.0.0', 0))
-            s.connect((host, port))
+            try:
+                s.connect((host, port))
+            except Exception:
+                s.close()
+                raise
             return s
 
     def negotiate_tunnel(self, bsock: socket.socket, host: str, port: int,
@@ -371,7 +388,7 @@ class BackendConnector:
             bsock = self.open_socket(host, port, 'tcp')
             ch_id, crd, status = self.negotiate_tunnel(bsock, host, port, 'tcp', client_cri)
             if ch_id is not None:
-                return bsock, ch_id, crd, status
+                return self._last_good_sock or bsock, ch_id, crd, status
             bsock.close()
             return None, None, None, status
         except Exception as e:

@@ -2,10 +2,9 @@
 name: Flappy
 slug: flappy
 description: >
-  KNX/IP failover proxy with instant hot-failover,
-  KNX IP Secure tunneling, USB via knxd, and configurable failback.
-  Supports TCP, UDP, and USB interfaces in any combination.
-version: "4.3.13"
+  KNX/IP failover with ordered IP/USB interfaces, monitoring and discovery.
+  Configure everything through Open Web UI. Existing settings are imported.
+version: "4.4.0"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
@@ -64,11 +63,11 @@ options:
   knxd_protocol: udp
 
   # Health checking
-  health_check_interval: 5
-  health_check_fall: 3
+  health_check_interval: 1
+  health_check_fall: 2
   health_check_rise: 2
   health_check_method: probe
-  connection_timeout: 5
+  connection_timeout: 1
 
   # Failover / failback
   failback_mode: auto
@@ -83,61 +82,9 @@ options:
   log_level: info
   notify_on_failover: false
 
-# ─── Schema ───────────────────────────────────────────────────────────
-schema:
-  # Frontend
-  frontend_protocol: list(udp|tcp|both)?
-  listen_port: port
-
-  # Primary
-  primary_host: str?
-  primary_port: port?
-  primary_protocol: list(tcp|udp|auto)?
-  primary_secure: bool?
-  primary_device_password: password?
-  primary_user_password: password?
-  primary_user_id: int(1,127)?
-
-  # Backup
-  backup_host: str?
-  backup_port: port?
-  backup_protocol: list(tcp|udp|auto)?
-  backup_secure: bool?
-  backup_device_password: password?
-  backup_user_password: password?
-  backup_user_id: int(1,127)?
-
-  # USB
-  usb_device: str?
-  usb_baud: int(1200,)?
-  usb_priority: list(last_resort|prefer)?
-  usb_mode: list(auto|knxd|native|socat)?
-  usb_knxd_extra_args: str?
-
-  # External knxd
-  knxd_host: str?
-  knxd_port: port?
-  knxd_protocol: list(tcp|udp)?
-
-  # Health
-  health_check_interval: int(1,)?
-  health_check_fall: int(1,)?
-  health_check_rise: int(1,)?
-  health_check_method: list(probe|heartbeat|both)?
-  connection_timeout: int(1,)?
-
-  # Failover
-  failback_mode: list(auto|manual|disabled)?
-  failback_delay_seconds: int(10,)?
-
-  # Sessions
-  max_sessions: int(1,16)?
-  session_timeout: int(30,)?
-  drain_timeout_seconds: int(1,30)?
-
-  # Logging
-  log_level: list(debug|info|warning|error)?
-  notify_on_failover: bool?
+# All configuration is managed in the ingress Web UI. Existing Supervisor
+# options above are retained only as migration defaults for older installations.
+schema: false
 
 # ─── Permissions ──────────────────────────────────────────────────────
 privileged: []

@@ -1,3 +1,8 @@
 #!/bin/bash
 exec 2>&1
+# Existing installations retain the legacy manager until their first UI save.
+# Empty installations must start the UI before an interface is configured.
+if [[ -f /data/flappy.json ]] || ! jq -e '[(.primary_host // ""), (.backup_host // ""), (.usb_device // ""), (.knxd_host // "")] | any(length > 0)' /data/options.json >/dev/null; then
+    exec python3 /knx_manager.py
+fi
 exec /run.sh

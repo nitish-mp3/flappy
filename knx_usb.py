@@ -29,9 +29,27 @@ import socket
 import signal
 import logging
 import threading
+from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
 log = logging.getLogger('knx_usb')
+
+
+def resolve_usb_path(device, sysfs_root='/sys/class/hidraw'):
+    """Resolve hidraw or a stable /dev symlink to libusb's bus/device path."""
+    if os.path.islink(device):
+        device = os.path.realpath(device)
+    if device.startswith('/dev/hidraw'):
+        sys_device = (Path(sysfs_root) / Path(device).name / 'device').resolve()
+        for parent in (sys_device, *sys_device.parents):
+            try:
+                bus = int((parent / 'busnum').read_text().strip())
+                address = int((parent / 'devnum').read_text().strip())
+                return f'/dev/bus/usb/{bus:03d}/{address:03d}'
+            except (OSError, ValueError):
+                continue
+        raise ValueError('Cannot resolve hidraw device to a USB bus address')
+    return device
 
 # ── Try to import pyusb ──────────────────────────────────────────────
 _PYUSB_AVAILABLE = False
@@ -277,7 +295,7 @@ class KNXUSBTransport:
                     log.error("No device path specified")
                     return False
                 # Parse /dev/bus/usb/BBB/DDD
-                parts = self.device_path.split('/')
+                parts = resolve_usb_path(self.device_path).split('/')
                 if len(parts) >= 5:
                     bus = int(parts[4])
                     addr = int(parts[5]) if len(parts) > 5 else None
@@ -659,6 +677,11 @@ class KNXUSBBridge:
         self.next_channel: int = 1
         self._client_sock: Optional[socket.socket] = None
         self._client_addr = None
+        self._client_lock = threading.Lock()
+        self._monitor_enabled = os.environ.get("FLAPPY_USB_MONITOR") == "1"
+        self._monitor_count = 0
+        self._monitor_recent = []
+        self._monitor_flush = 0
         self._recv_seq: int = 0
         self._send_seq: int = 0
         self._usb_reader_thread: Optional[threading.Thread] = None
@@ -713,14 +736,7 @@ class KNXUSBBridge:
             try:
                 sock, addr = self.server_sock.accept()
                 log.info(f"USB bridge: client connected from {addr}")
-                # Only allow one client at a time (like a real KNX interface)
-                if self._client_sock:
-                    try:
-                        self._client_sock.close()
-                    except Exception:
-                        pass
-                self._client_sock = sock
-                self._client_sock.settimeout(120.0)
+                sock.settimeout(10.0)
                 threading.Thread(target=self._handle_client, args=(sock,),
                                  daemon=True, name='usb-bridge-client').start()
             except socket.timeout:
@@ -742,10 +758,12 @@ class KNXUSBBridge:
         )
 
         try:
-            while self.running and sock == self._client_sock:
+            while self.running:
                 try:
                     svc, body = read_tcp_frame(sock)
                 except socket.timeout:
+                    if sock is not self._client_sock:
+                        break
                     continue
                 if svc is None:
                     break
@@ -765,6 +783,12 @@ class KNXUSBBridge:
                     sock.sendall(resp)
 
                 elif svc == CONNECT_REQ:
+                    with self._client_lock:
+                        if self._client_sock is not None and self._client_sock is not sock:
+                            sock.sendall(make_frame(CONNECT_RESP, bytes([0, 0x24])))
+                            continue
+                        self._client_sock = sock
+                    sock.settimeout(120.0)
                     # Accept the connection
                     ch_id = self.next_channel
                     self.next_channel = (self.next_channel % 255) + 1
@@ -782,6 +806,10 @@ class KNXUSBBridge:
                     addr_str = f"{addr_hi >> 4}.{addr_hi & 0x0F}.{addr_lo}"
                     log.info(f"USB bridge: tunnel ch={ch_id} established "
                              f"(individual address {addr_str})")
+
+                elif sock is not self._client_sock:
+                    # Description-only clients must never affect the active tunnel.
+                    break
 
                 elif svc == CONNSTATE_REQ:
                     if body and len(body) >= 1:
@@ -801,6 +829,7 @@ class KNXUSBBridge:
                         sock.sendall(resp)
                         self.active_channel = 0
                         log.info(f"USB bridge: tunnel ch={ch_id} disconnected")
+                        break
 
                 elif svc == TUNNELLING_REQ:
                     if body and len(body) >= 4:
@@ -808,9 +837,20 @@ class KNXUSBBridge:
                         ch_id = body[1]
                         seq = body[2]
 
+                        if ch_id != self.active_channel:
+                            sock.sendall(make_frame(TUNNELLING_ACK, bytes([4, ch_id, seq, 0x21])))
+                            continue
+                        duplicate = seq == ((self._recv_seq - 1) & 0xff)
+                        if seq != self._recv_seq and not duplicate:
+                            sock.sendall(make_frame(TUNNELLING_ACK, bytes([4, ch_id, seq, 0x04])))
+                            continue
+
                         # Send ACK back to client
                         ack_body = bytes([4, ch_id, seq, 0x00])
                         sock.sendall(make_frame(TUNNELLING_ACK, ack_body))
+                        if duplicate:
+                            continue
+                        self._recv_seq = (self._recv_seq + 1) & 0xff
 
                         # Extract cEMI and forward to USB
                         cemi = body[4:]
@@ -840,8 +880,10 @@ class KNXUSBBridge:
             if self.running:
                 log.debug(f"USB bridge client handler: {e}")
         finally:
-            if sock == self._client_sock:
-                self._client_sock = None
+            with self._client_lock:
+                if sock == self._client_sock:
+                    self._client_sock = None
+                    self.active_channel = 0
             try:
                 sock.close()
             except Exception:
@@ -859,10 +901,24 @@ class KNXUSBBridge:
                 time.sleep(1)
                 continue
 
+            if self._monitor_enabled and self._monitor_recent and time.monotonic() - self._monitor_flush >= 1:
+                from knx_config import atomic_write
+                self._monitor_flush = time.monotonic()
+                try:
+                    atomic_write(f'/run/flappy-usb-{self.port}.json', json.dumps({
+                        'state': 'passive USB tap', 'received': self._monitor_count,
+                        'duplicates': 0, 'error': '', 'last_telegram': self._monitor_recent[0]['timestamp'],
+                        'recent': self._monitor_recent}))
+                except OSError:
+                    log.warning('Could not publish USB monitoring metrics')
             cemi = self.usb.recv_cemi(timeout_ms=500)
             if cemi is None:
                 continue
 
+            if self._monitor_enabled:
+                self._monitor_count += 1
+                self._monitor_recent.insert(0, {'timestamp': time.time(), 'cemi': cemi[:256].hex()})
+                del self._monitor_recent[20:]
             mc = cemi[0] if cemi else 0
             log.info(f"←USB: cEMI mc=0x{mc:02X} len={len(cemi)}")
 
@@ -946,7 +1002,7 @@ def main():
             sys.exit(1)
 
         # Write PID file
-        pid_file = "/run/knx-usb-bridge.pid"
+        pid_file = os.environ.get("FLAPPY_USB_PID", "/run/knx-usb-bridge.pid")
         try:
             with open(pid_file, 'w') as f:
                 f.write(str(os.getpid()))

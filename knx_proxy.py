@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KNX/IP Failover Proxy  v4.1.3
+KNX/IP Failover Proxy  v4.4.0
 ===============================
 Production-grade KNX/IP tunnelling proxy with:
   - TCP ↔ TCP, TCP ↔ UDP, UDP ↔ TCP, UDP ↔ UDP
@@ -167,6 +167,7 @@ class KNXProxy:
         # Prevents hammering a backend that just rejected us
         self._backend_cooldowns: dict = {}
         self._cooldown_seconds = 10  # seconds to wait after a rejection
+        self._reroute_lock = threading.Lock()
         self._last_sighup_time: float = 0  # prevent rapid SIGHUP storms
 
         # Secure session manager
@@ -195,19 +196,16 @@ class KNXProxy:
     # ──────────────────────────────────────────────────────────────────
 
     def _on_sighup(self):
+        with self._reroute_lock:
+            self._reroute_sessions()
+
+    def _reroute_sessions(self):
         """
         Backend changed — hot re-route all sessions to the new backend.
         Instead of draining (which disconnects HA and makes devices unavailable),
         we open new backend connections and swap them in-place.
         The client session is never interrupted.
         """
-        # Cooldown: don't process SIGHUP if we just handled one
-        now = time.monotonic()
-        if now - self._last_sighup_time < 5.0:
-            log.debug("SIGHUP: ignored (cooldown — last swap was < 5s ago)")
-            return
-        self._last_sighup_time = now
-
         log.info("SIGHUP received — hot re-routing sessions to new backend")
         self.sessions.record_failover()
         clear_backend_reject()
@@ -233,11 +231,14 @@ class KNXProxy:
         for sess in sessions:
             if not sess.alive or sess.draining:
                 continue
+            if sess.backend_addr == (b_host, b_port) and sess.backend_type == b_proto:
+                continue
             try:
                 self._hot_swap_backend(sess, b_host, b_port, b_proto)
                 success += 1
             except Exception as e:
                 log.warning(f"Hot-swap failed for ch={sess.channel_id}: {e}")
+                report_backend_reject(b_host, b_port, b_proto, E_DATA_CONN)
                 failed += 1
 
         log.info(f"Hot re-route complete: {success} re-routed, {failed} failed")
@@ -265,6 +266,15 @@ class KNXProxy:
 
     def _get_secure_config(self, host: str, port: int) -> Tuple[bool, str, str, int]:
         """Determine if a backend should use secure mode."""
+        runtime = os.environ.get('FLAPPY_RUNTIME')
+        if runtime:
+            with open(runtime, encoding='utf-8') as f:
+                entries = json.load(f)['interfaces']
+            for item in entries:
+                if item.get('host') == host and item.get('port') == port:
+                    return (item.get('secure', False), item.get('device_password', ''),
+                            item.get('user_password', ''), item.get('user_id', 1))
+            return False, '', '', 1
         # Check against configured primary host/port
         if PRIMARY_SECURE and host == PRIMARY_HOST and port == PRIMARY_PORT:
             return True, PRIMARY_DEVICE_PW, PRIMARY_USER_PW, PRIMARY_USER_ID
@@ -330,8 +340,7 @@ class KNXProxy:
             return None
 
         log.info(f"Secure handshake: key exchange OK, session_id={sec.session_id}")
-        log.debug(f"Secure handshake: session_key={sec.session_key[:4].hex()}.., "
-                  f"pub_keys_xor={sec._pub_keys_xor[:4].hex()}..")
+        log.debug("Secure handshake: session key established")
 
         # 3. SESSION_AUTHENTICATE — must be wrapped in SECURE_WRAPPER
         #    Per KNX AN159: after key exchange, ALL frames use SECURE_WRAPPER
@@ -953,6 +962,12 @@ class KNXProxy:
     # ──────────────────────────────────────────────────────────────────
 
     def _relay_from_backend(self, sess: Session):
+        # Iteration avoids growing the Python stack on repeated reconnects.
+        while sess.alive and self.running:
+            if not self._relay_once(sess):
+                return
+
+    def _relay_once(self, sess: Session):
         """Read frames from backend and forward to client."""
         udp_sock = self.udp.sock if self.udp else None
         relay_count = 0
@@ -961,15 +976,20 @@ class KNXProxy:
                  f"backend={sess.backend_addr} type={sess.backend_type}")
 
         while sess.alive and self.running:
+            read_sock = sess.backend_sock
             try:
                 if sess.backend_type == 'tcp':
-                    svc, body = read_tcp_frame(sess.backend_sock)
+                    svc, body = read_tcp_frame(read_sock)
+                    if read_sock is not sess.backend_sock:
+                        continue
                     if svc is None:
                         log.info(f"Relay ch={sess.channel_id}: backend stream ended")
                         break
                     data = make_frame(svc, body)
                 else:
-                    data, _ = sess.backend_sock.recvfrom(2048)
+                    data, _ = read_sock.recvfrom(2048)
+                    if read_sock is not sess.backend_sock:
+                        continue
                     svc, body = parse_frame(data)
                     if svc is None:
                         continue
@@ -981,6 +1001,8 @@ class KNXProxy:
                     sess.close()
                 continue
             except Exception as e:
+                if read_sock is not sess.backend_sock:
+                    continue
                 if sess.alive:
                     log.debug(f"Backend relay ch={sess.channel_id}: {e}")
                 break
@@ -1094,50 +1116,44 @@ class KNXProxy:
                 log.info(f"Relay ch={sess.channel_id}: unhandled "
                          f"{svc_name(svc)} svc=0x{svc:04X} len={len(body)}")
 
-        # Backend connection lost — try hot-swap to new backend
+        # Keep the frontend session during a bounded outage while the manager
+        # selects another interface. Do not replay already-ACKed bus commands.
+        deadline = time.monotonic() + SESSION_TIMEOUT
+        while sess.alive and self.running and time.monotonic() < deadline:
+            if read_sock is not sess.backend_sock:
+                return True
+            backend = read_backend()
+            if backend:
+                try:
+                    self._hot_swap_backend(sess, *backend, expected_socket=read_sock)
+                    return True
+                except Exception as exc:
+                    report_backend_reject(*backend, E_DATA_CONN)
+                    log.warning(f"Reconnect ch={sess.channel_id}: {exc}")
+            sess.drain_event.wait(2)
         if sess.alive:
-            log.info(f"Session ch={sess.channel_id} backend connection lost — attempting hot-swap")
-            try:
-                backend = read_backend()
-                if backend:
-                    b_host, b_port, b_proto = backend
-                    # Only hot-swap if the backend is different or we can reconnect
-                    self._hot_swap_backend(sess, b_host, b_port, b_proto)
-                    # Restart relay loop with new backend
-                    log.info(f"Session ch={sess.channel_id} relay resumed after hot-swap")
-                    self._relay_from_backend(sess)
-                    return
-            except Exception as e:
-                log.warning(f"Hot-swap failed for ch={sess.channel_id}: {e}")
-
-            # Hot-swap failed — close the session
             self.sessions.remove(sess.channel_id)
             self._disconnect_backend(sess)
-            log.info(f"Session ch={sess.channel_id} relay ended "
-                     f"(uptime={sess.uptime():.0f}s, telegrams={sess.telegrams_fwd})")
             sess.close()
+        return False
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────
 
-    def _hot_swap_backend(self, sess: Session,
-                          b_host: str, b_port: int, b_proto: str):
+    def _hot_swap_backend(self, sess: Session, b_host: str, b_port: int,
+                          b_proto: str, expected_socket=None):
+        with sess._swap_lock:
+            if not sess.alive or (expected_socket is not None and expected_socket is not sess.backend_sock):
+                return
+            return self._swap_backend_locked(sess, b_host, b_port, b_proto)
+
+    def _swap_backend_locked(self, sess: Session,
+                             b_host: str, b_port: int, b_proto: str):
         """
         Open a new backend connection, negotiate a tunnel, and swap it
         into an existing session. The client never disconnects.
         """
-        # Disconnect old backend (best-effort)
-        try:
-            old_proto = PROTO_TCP if sess.backend_type == 'tcp' else PROTO_UDP
-            body = bytes([sess._backend_ch, 0x00]) + make_hpai('0.0.0.0', 0, old_proto)
-            disc_frame = make_frame(DISCONNECT_REQ, body)
-            if sess._secure_session:
-                disc_frame = sess._secure_session.encrypt_frame(disc_frame)
-            sess.send_to_backend(disc_frame)
-        except Exception:
-            pass
-
         # Check if new backend requires secure
         is_secure, device_pw, user_pw, user_id = self._get_secure_config(b_host, b_port)
 
@@ -1148,65 +1164,75 @@ class KNXProxy:
         # Open new backend socket
         bsock = self.connector.open_socket(b_host, b_port, b_proto)
 
-        if is_secure:
-            # Establish secure session on new backend
-            new_sec = self._establish_secure_session(
-                bsock, b_host, b_port, device_pw, user_pw, user_id
-            )
-            if new_sec is None:
-                bsock.close()
-                raise RuntimeError("Hot-swap: secure session establishment failed")
+        committed = False
+        try:
+            if is_secure:
+                # Establish secure session on new backend
+                new_sec = self._establish_secure_session(
+                    bsock, b_host, b_port, device_pw, user_pw, user_id
+                )
+                if new_sec is None:
+                    bsock.close()
+                    raise RuntimeError("Hot-swap: secure session establishment failed")
 
-            ch_id, crd, status = self._negotiate_tunnel_secure(bsock, new_sec)
-            if ch_id is None:
-                bsock.close()
-                raise RuntimeError(
-                    f"Hot-swap: secure tunnel rejected (status=0x{(status or 0):02x})")
-
-            sess._secure_session = new_sec
-        else:
-            sess._secure_session = None
-
-            # Negotiate tunnel
-            ch_id, crd, status = self.connector.negotiate_tunnel(
-                bsock, b_host, b_port, b_proto
-            )
-
-            # For TCP, negotiate_tunnel opens fresh sockets per attempt.
-            if self.connector._last_good_sock is not None:
-                bsock = self.connector._last_good_sock
-
-            # Protocol fallback: if 0x22 on one protocol, try the other
-            if ch_id is None and status == 0x22:
-                alt_proto = 'udp' if b_proto == 'tcp' else 'tcp'
-                log.info(f"Hot-swap: {b_proto.upper()} tunnel rejected (0x22) "
-                         f"— trying {alt_proto.upper()} fallback")
-                if alt_proto == 'udp':
-                    fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_udp_fallback(
-                        b_host, b_port)
-                else:
-                    fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_tcp_fallback(
-                        b_host, b_port)
-                if fb_sock and fb_ch is not None:
-                    bsock = fb_sock
-                    ch_id = fb_ch
-                    crd = fb_crd
-                    b_proto = alt_proto
-                    log.info(f"Hot-swap: {alt_proto.upper()} fallback succeeded ch={ch_id}")
-                else:
+                ch_id, crd, status = self._negotiate_tunnel_secure(bsock, new_sec)
+                if ch_id is None:
+                    bsock.close()
                     raise RuntimeError(
-                        f"Backend rejected CONNECT on both protocols "
-                        f"(status=0x{(status or 0):02x})")
+                        f"Hot-swap: secure tunnel rejected (status=0x{(status or 0):02x})")
 
-        if ch_id is None:
-            raise RuntimeError(f"Backend rejected CONNECT (status=0x{(status or 0):02x})")
+            else:
+                new_sec = None
 
-        # Setup keep-alive timeout for the long-running socket relay
-        bsock.settimeout(65.0)
+                # Negotiate tunnel
+                ch_id, crd, status = self.connector.negotiate_tunnel(
+                    bsock, b_host, b_port, b_proto
+                )
 
-        # Swap the backend in-place
-        sess.reset_seq_for_reconnect()
-        sess.swap_backend(bsock, b_proto, (b_host, b_port), ch_id)
+                # For TCP, negotiate_tunnel opens fresh sockets per attempt.
+                if self.connector._last_good_sock is not None:
+                    bsock = self.connector._last_good_sock
+
+                # Protocol fallback: if 0x22 on one protocol, try the other
+                if ch_id is None and status == 0x22:
+                    alt_proto = 'udp' if b_proto == 'tcp' else 'tcp'
+                    log.info(f"Hot-swap: {b_proto.upper()} tunnel rejected (0x22) "
+                             f"— trying {alt_proto.upper()} fallback")
+                    if alt_proto == 'udp':
+                        fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_udp_fallback(
+                            b_host, b_port)
+                    else:
+                        fb_sock, fb_ch, fb_crd, fb_st = self.connector.try_tcp_fallback(
+                            b_host, b_port)
+                    if fb_sock and fb_ch is not None:
+                        bsock = fb_sock
+                        ch_id = fb_ch
+                        crd = fb_crd
+                        b_proto = alt_proto
+                        log.info(f"Hot-swap: {alt_proto.upper()} fallback succeeded ch={ch_id}")
+                    else:
+                        raise RuntimeError(
+                            f"Backend rejected CONNECT on both protocols "
+                            f"(status=0x{(status or 0):02x})")
+
+            if ch_id is None:
+                raise RuntimeError(f"Backend rejected CONNECT (status=0x{(status or 0):02x})")
+
+            # Setup keep-alive timeout for the long-running socket relay
+            bsock.settimeout(65.0)
+
+            committed = True
+            # Commit only after negotiation succeeds; a failed failback retains the
+            # old live tunnel and its secure state.
+            self._disconnect_backend(sess)
+            sess._secure_session = new_sec
+            if crd and len(crd) >= 4:
+                sess._backend_ia = (crd[2], crd[3])
+            sess.reset_seq_for_reconnect()
+            sess.swap_backend(bsock, b_proto, (b_host, b_port), ch_id)
+        finally:
+            if not committed:
+                bsock.close()
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers

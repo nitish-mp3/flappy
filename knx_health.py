@@ -120,7 +120,8 @@ def probe_description_udp(host: str, port: int, timeout: int = 5) -> HealthResul
         s.bind(('0.0.0.0', 0))
         local_addr = s.getsockname()
         log.debug(f"UDP probe {host}:{port} from {local_addr[0]}:{local_addr[1]} (timeout={timeout}s)")
-        s.sendto(desc_req, (host, port))
+        s.connect((host, port))
+        s.send(desc_req)
         data, src = s.recvfrom(512)
         elapsed = (time.monotonic() - start) * 1000
         if valid_desc_response(data):
@@ -150,7 +151,8 @@ def probe_description_tcp(host: str, port: int, timeout: int = 5) -> HealthResul
         log.debug(f"TCP probe {host}:{port} connecting (timeout={timeout}s)")
         s.connect((host, port))
         s.sendall(desc_req)
-        data = s.recv(512)
+        svc, body = read_tcp_frame(s)
+        data = make_frame(svc, body) if svc is not None and body is not None else b''
         elapsed = (time.monotonic() - start) * 1000
         if valid_desc_response(data):
             log.debug(f"TCP probe {host}:{port} OK ({elapsed:.0f}ms, {len(data)}B)")

@@ -46,6 +46,7 @@ COPY knx_health.py    /knx_health.py
 COPY knx_const.py     /knx_const.py
 COPY knx_usb.py       /knx_usb.py
 COPY knx_webui.py     /knx_webui.py
+COPY knx_config.py knx_manager.py knx_discovery.py knx_monitor.py knx_events.py /
 COPY www/             /www/
 
 RUN chmod 0755 \

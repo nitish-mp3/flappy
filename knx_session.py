@@ -46,7 +46,7 @@ class Session:
         '_seq_out_offset', '_seq_in_offset',
         '_last_out_seq', '_last_in_seq',
         '_client_ia', '_backend_ia',
-        '_secure_session',
+        '_secure_session', '_swap_lock',
     ]
 
     def __init__(self, channel_id: int, client_type: str,
@@ -54,6 +54,7 @@ class Session:
                  client_sock: Optional[socket.socket],
                  backend_type: str, backend_addr: Tuple[str, int],
                  backend_sock: socket.socket):
+        self._swap_lock = threading.RLock()
         self.channel_id   = channel_id
         self.client_type  = client_type
         self.client_ctrl  = client_ctrl
@@ -141,6 +142,10 @@ class Session:
         # Close old backend socket (best effort)
         if old_sock:
             try:
+                try:
+                    old_sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 old_sock.close()
             except Exception:
                 pass

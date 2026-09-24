@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# KNX Failover Proxy v4.1.3  — Backend Manager
+# KNX Failover Proxy v4.4.0  — Backend Manager
 # =============================================================================
 # This script:
 #   1. Loads config from /data/options.json
@@ -22,7 +22,7 @@ readonly PROXY_PID_FILE="/run/knx-proxy.pid"
 readonly WEBUI_PID_FILE="/run/knx-webui.pid"
 readonly HA_NOTIFY_URL="http://supervisor/core/api/services/persistent_notification/create"
 readonly SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
-readonly VERSION="4.3.11"
+readonly VERSION="4.4.0"
 
 readonly STATE_PRIMARY="PRIMARY"
 readonly STATE_BACKUP="BACKUP"

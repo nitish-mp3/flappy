@@ -11,12 +11,20 @@ log()  { echo "[cont-init] $*"; }
 warn() { echo "[cont-init] WARN: $*"; }
 fail() { echo "[cont-init] FATAL: $*" >&2; exit 1; }
 
-log "KNX Failover Proxy v4.3.6 — pre-flight checks"
+log "KNX Failover Proxy v4.4.0 — pre-flight checks"
+
+if [[ -f /data/flappy.json ]]; then
+    PYTHONPATH=/ python3 -c 'from knx_config import load_config, validate; validate(load_config())'
+    exit $?
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Verify options file exists and is valid JSON
 # ---------------------------------------------------------------------------
-[[ -f "$OPTIONS_FILE" ]] || fail "Missing $OPTIONS_FILE"
+if [[ ! -f "$OPTIONS_FILE" ]]; then
+    log "No legacy options file — configure through the Web UI"
+    exit 0
+fi
 jq empty "$OPTIONS_FILE" 2>/dev/null || fail "Options file is not valid JSON"
 
 # ---------------------------------------------------------------------------
@@ -36,7 +44,7 @@ PRIMARY_SECURE="$(read_opt primary_secure)"
 BACKUP_SECURE="$(read_opt backup_secure)"
 
 KNXD_HOST="$(read_opt knxd_host)"
-[[ -n "$PRIMARY_HOST" || -n "$BACKUP_HOST" || -n "$KNXD_HOST" || -n "$USB_DEVICE" ]] || fail "At least one backend config (primary, backup, knxd, or usb) must be provided"
+[[ -n "$PRIMARY_HOST" || -n "$BACKUP_HOST" || -n "$KNXD_HOST" || -n "$USB_DEVICE" ]] || log "No backend yet — configure interfaces in the Web UI"
 
 # ---------------------------------------------------------------------------
 # 4. Validate secure config consistency

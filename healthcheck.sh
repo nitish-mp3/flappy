@@ -11,6 +11,7 @@
 set -uo pipefail
 
 OPTIONS_FILE="/data/options.json"
+[[ -f /run/flappy-runtime.json ]] && OPTIONS_FILE="/run/flappy-runtime.json"
 STATE_FILE="/run/knx-failover.state"
 METRICS_FILE="/run/knx-metrics.json"
 LISTEN_PORT="3671"
