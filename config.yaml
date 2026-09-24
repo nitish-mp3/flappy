@@ -4,7 +4,7 @@ slug: flappy
 description: >
   KNX/IP failover with ordered IP/USB interfaces, monitoring and discovery.
   Configure everything through Open Web UI. Existing settings are imported.
-version: "4.4.0"
+version: "4.4.1"
 homeassistant: "2024.1.0"
 arch:
   - aarch64
