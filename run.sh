@@ -1053,7 +1053,7 @@ start_webui() {
     stop_webui
     local port="${INGRESS_PORT:-8099}"
     log_info "Starting Web UI on port ${port}"
-    python3 /knx_webui.py "$port" &
+    FLAPPY_CONTROL_PID="$$" python3 /knx_webui.py "$port" &
     WEBUI_PID="$!"
     echo "$WEBUI_PID" > "$WEBUI_PID_FILE"
     sleep 1

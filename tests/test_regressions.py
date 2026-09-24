@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import sys
 import tempfile
 import threading
@@ -125,6 +126,34 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(req)
         self.assertEqual(cm.exception.code,409)
         cm.exception.close()
+
+    def test_restart_without_supervisor_token_uses_flappy_service_pid(self):
+        server=web.ThreadedHTTPServer(('127.0.0.1',0),web.APIHandler)
+        worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
+        self.addCleanup(server.server_close);self.addCleanup(server.shutdown)
+        completed=threading.Event(); observed=[]
+        def fake_kill(pid, sig):
+            observed.append((pid,sig));completed.set()
+        with patch.object(web,'SUPERVISOR_TOKEN',''), patch.dict(os.environ,{'FLAPPY_CONTROL_PID':'2468'}), \
+             patch.object(web,'_is_service_controller',return_value=True), patch.object(web.os,'kill',side_effect=fake_kill):
+            req=urllib.request.Request(f'http://127.0.0.1:{server.server_port}/api/restart',
+                                       data=b'{}',headers={'Content-Type':'application/json'})
+            with urllib.request.urlopen(req) as response: result=json.load(response)
+            self.assertTrue(result['ok'])
+            self.assertTrue(completed.wait(2))
+            self.assertEqual(observed,[(2468,signal.SIGTERM)])
+
+    def test_restart_explains_manual_fallback_only_without_either_control_path(self):
+        server=web.ThreadedHTTPServer(('127.0.0.1',0),web.APIHandler)
+        worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
+        self.addCleanup(server.server_close);self.addCleanup(server.shutdown)
+        with patch.object(web,'SUPERVISOR_TOKEN',''), patch.dict(os.environ,{'FLAPPY_CONTROL_PID':''}):
+            req=urllib.request.Request(f'http://127.0.0.1:{server.server_port}/api/restart',
+                                       data=b'{}',headers={'Content-Type':'application/json'})
+            with self.assertRaises(urllib.error.HTTPError) as cm: urllib.request.urlopen(req)
+            self.assertEqual(cm.exception.code,503)
+            self.assertIn('restart Flappy from Home Assistant',cm.exception.read().decode())
+            cm.exception.close()
 
 
 class PolicyTests(unittest.TestCase):

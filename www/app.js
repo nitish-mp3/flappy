@@ -41,6 +41,7 @@ async function refresh() {
     $('pending').hidden=!interfaces.needs_restart;
     $('stale').hidden=!interfaces.stale||interfaces.legacy_mode; $('migration').hidden=!interfaces.legacy_mode;
     const active=(interfaces.interfaces||[]).find(i=>i.active);
+    $('no-backend').hidden=!!active||!!status.backend||(interfaces.interfaces||[]).some(i=>i.role==='fallback'&&i.healthy===true);
     $('active-name').textContent=active?.name || (status.backend?status.backend.host:'No active interface');
     $('active-detail').textContent=active ? 'Selected for Home Assistant connections' : (status.backend?'Legacy manager · save and restart to enable the new interface manager':'Waiting for a healthy fallback interface');
     $('sessions-count').textContent=status.active_sessions+' / '+status.max_sessions;

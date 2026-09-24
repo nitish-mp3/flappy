@@ -298,36 +298,41 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
             self._json({'error': str(e)}, 500)
 
     def _api_restart(self):
-        """Restart the add-on via HA Supervisor API."""
-        if not SUPERVISOR_TOKEN:
-            self._json({'error': 'Supervisor token not available'}, 503)
+        """Apply saved settings through the s6-managed service, with Supervisor as fallback."""
+        controller_pid = os.environ.get('FLAPPY_CONTROL_PID', '')
+        can_restart_locally = controller_pid.isdigit() and _is_service_controller(controller_pid)
+        if not SUPERVISOR_TOKEN and not can_restart_locally:
+            self._json({'error': 'Cannot locate Flappy’s supervised process. Save succeeded; restart Flappy from Home Assistant to apply it.'}, 503)
             return
         if not RESTART_LOCK.acquire(blocking=False):
-            self._json({'ok': True, 'message': 'Add-on restart is already in progress'})
+            self._json({'ok': True, 'message': 'Flappy restart is already in progress'})
             return
 
         def restart_after_response():
             try:
-                # Let the HTTP response reach ingress before Supervisor stops us.
-                threading.Event().wait(0.2)
-                req = urllib.request.Request(
-                    'http://supervisor/addons/self/restart', method='POST',
-                    headers={'Authorization': f'Bearer {SUPERVISOR_TOKEN}',
-                             'Content-Type': 'application/json'},
-                )
-                with urllib.request.urlopen(req, timeout=10):
-                    pass
+                # Let the HTTP response reach ingress before the service stops us.
+                threading.Event().wait(0.4)
+                if can_restart_locally:
+                    os.kill(int(controller_pid), signal.SIGTERM)
+                else:
+                    req = urllib.request.Request(
+                        'http://supervisor/addons/self/restart', method='POST',
+                        headers={'Authorization': f'Bearer {SUPERVISOR_TOKEN}',
+                                 'Content-Type': 'application/json'},
+                    )
+                    with urllib.request.urlopen(req, timeout=10):
+                        pass
             except Exception:
-                log.warning('Supervisor did not confirm the restart request')
+                log.exception('Could not request the Flappy service restart')
             finally:
                 RESTART_LOCK.release()
 
         try:
             threading.Thread(target=restart_after_response, daemon=True).start()
-            self._json({'ok': True, 'message': 'Add-on restart requested'})
-        except Exception as e:
+            self._json({'ok': True, 'message': 'Flappy restart requested; saved configuration will be applied'})
+        except Exception as exc:
             RESTART_LOCK.release()
-            self._json({'error': str(e)}, 500)
+            self._json({'error': str(exc)}, 500)
 
     def _api_health_probe(self, body: bytes):
         """Run an ad-hoc health probe against a given host."""
@@ -401,6 +406,17 @@ def _read_metrics_file() -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+
+def _is_service_controller(pid):
+    """Accept only our supervised long-run process, never a caller-selected PID."""
+    try:
+        with open(f'/proc/{int(pid)}/cmdline', 'rb') as f:
+            raw = f.read().replace(b'\0', b' ')
+        return b'/run.sh' in raw or b'knx_manager.py' in raw
+    except (OSError, ValueError):
+        return False
 
 
 # ── Threaded HTTP server ──────────────────────────────────────────────

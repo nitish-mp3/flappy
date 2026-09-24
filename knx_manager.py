@@ -292,7 +292,10 @@ def main():
                     child_retries[name] = 0 if now - child_started.get(name, now) > 60 else child_retries.get(name, 0) + 1
                     next_spawn[name] = now + min(30, 2 ** min(child_retries[name], 5))
                     child_started[name] = now
-                    children[name] = subprocess.Popen([sys.executable, str(ROOT / args[0]), *args[1:]], env=env)
+                    child_env = dict(env)
+                    if name == 'webui':
+                        child_env['FLAPPY_CONTROL_PID'] = str(os.getpid())
+                    children[name] = subprocess.Popen([sys.executable, str(ROOT / args[0]), *args[1:]], env=child_env)
                     if name == 'proxy':
                         proxy_started = time.monotonic()
                         atomic_write('/run/knx-proxy.pid', str(children[name].pid))
